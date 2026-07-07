@@ -221,18 +221,36 @@ def build_ls_oi(symbol: str, timeframe: str = "15m", lookback: int = 24) -> dict
     ex = _ex()
     out = {"symbol": symbol, "timeframe": timeframe}
     try:
-        ls = ex.fetch_long_short_ratio_history(symbol, timeframe, limit=3)
-        info = ls[-1]["info"]
+        ls = []
+        for tf_try in [timeframe, "1h", "4h", "1d"]:  # algunos venues (bybit) no soportan todos los periodos
+            try:
+                ls = ex.fetch_long_short_ratio_history(symbol, tf_try, limit=3)
+            except Exception:
+                ls = []
+            if ls:
+                out["ls_period"] = tf_try
+                break
+        if not ls:
+            raise ValueError("sin datos L/S en este venue")
+        info = ls[-1].get("info", {})
         out["ls_ratio"] = round(float(ls[-1]["longShortRatio"]), 4)
-        out["long_pct"] = round(float(info["longAccount"]) * 100, 2)
-        out["short_pct"] = round(float(info["shortAccount"]) * 100, 2)
+        long_acc = info.get("longAccount") or info.get("buyRatio")
+        short_acc = info.get("shortAccount") or info.get("sellRatio")
+        if long_acc:
+            out["long_pct"] = round(float(long_acc) * 100, 2)
+        if short_acc:
+            out["short_pct"] = round(float(short_acc) * 100, 2)
         out["ls_prev"] = round(float(ls[0]["longShortRatio"]), 4)
     except Exception as e:
         out["ls_error"] = str(e)[:70]
     try:
         oi = ex.fetch_open_interest_history(symbol, timeframe, limit=lookback)
-        now, then = oi[-1]["openInterestValue"], oi[0]["openInterestValue"]
-        out["oi_usd"] = round(now, 0)
+        _v = lambda r: r.get("openInterestValue") or r.get("openInterestAmount")
+        now, then = _v(oi[-1]), _v(oi[0])
+        if oi[-1].get("openInterestValue"):
+            out["oi_usd"] = round(now, 0)
+        else:
+            out["oi_base"] = round(now, 0)  # venue sin valor USD: OI en moneda base
         out["oi_change_pct"] = round((now - then) / then * 100, 2) if then else None
         out["oi_periods"] = len(oi)
     except Exception as e:

@@ -5,7 +5,7 @@ services:
     name: perp-extras-mcp
     runtime: docker
     plan: free
-    region: singapore
+    region: frankfurt
     autoDeploy: true
     dockerfilePath: ./Dockerfile
     # Sin healthCheckPath a propósito: /mcp es POST-only (GET devuelve 404/406).
