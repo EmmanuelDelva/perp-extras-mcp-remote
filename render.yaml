@@ -1,0 +1,12 @@
+# Render Blueprint — deploy del MCP delva-perp-extras como connector remoto.
+# En Render: New +  ->  Blueprint  ->  elegir este repo  ->  Apply.
+services:
+  - type: web
+    name: perp-extras-mcp
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    # Sin healthCheckPath a propósito: /mcp es POST-only (GET devuelve 404/406).
+    # Render marca el servicio live al detectar el $PORT enlazado.
+    envVars: []
