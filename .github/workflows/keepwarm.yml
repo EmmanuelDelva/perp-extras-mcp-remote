@@ -1,0 +1,15 @@
+name: keep-warm
+on:
+  schedule:
+    - cron: '*/12 * * * *'   # Render free duerme a los 15 min de inactividad
+  workflow_dispatch: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping /mcp (initialize)
+        run: |
+          curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 60 \
+            -X POST https://perp-extras-mcp.onrender.com/mcp \
+            -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"keepwarm","version":"1"}}}'

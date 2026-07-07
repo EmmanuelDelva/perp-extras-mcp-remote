@@ -13,6 +13,7 @@ Fuente real: ccxt.binanceusdm. Sin inventos: dato faltante -> null.
 from __future__ import annotations
 import concurrent.futures as cf
 import json
+import os
 import time
 from pathlib import Path
 import ccxt
@@ -33,8 +34,15 @@ NATIVE_MIN = {
 ALL_NATIVE = list(NATIVE_MIN.keys())
 
 
-def _ex():
-    ex = ccxt.binanceusdm({'enableRateLimit': True})
+# Cadena de venues: Binance geobloquea IPs de datacenter US (p.ej. Render Oregon) ->
+# sondear en orden y quedarse con el primer venue VIVO (1 sondeo por proceso).
+VENUES = [v.strip() for v in os.environ.get("PERP_VENUES", "binanceusdm,bybit,okx").split(",") if v.strip()]
+_venue_cache: dict = {}
+_active_venue: list = []
+
+
+def _mk(venue: str):
+    ex = getattr(ccxt, venue)({'enableRateLimit': True})
     # pool amplio: el snapshot dispara ~15 requests concurrentes (fix del TF caído por pool=10)
     try:
         import requests.adapters as _ra
@@ -42,6 +50,22 @@ def _ex():
     except Exception:
         pass
     return ex
+
+
+def _ex():
+    if _active_venue:
+        return _venue_cache[_active_venue[0]]
+    last = None
+    for v in VENUES:
+        try:
+            ex = _venue_cache.get(v) or _mk(v)
+            _venue_cache[v] = ex
+            ex.fetch_time()  # geobloqueo/venue caído -> excepción -> siguiente
+            _active_venue.append(v)
+            return ex
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"ningún venue vivo en {VENUES}: {str(last)[:80]}")
 
 
 def _tf_to_min(tf: str) -> int:
@@ -53,14 +77,17 @@ def _tf_to_min(tf: str) -> int:
 
 
 def _fetch_any(ex, symbol: str, tf: str, need: int) -> pd.DataFrame:
-    """OHLCV de cualquier TF: nativo directo, o resampleado desde el mayor nativo que lo divide."""
-    tf = tf.strip().lower()
-    if tf in NATIVE_MIN:
+    """OHLCV de cualquier TF: nativo del VENUE ACTUAL directo, o resampleado desde el mayor nativo que lo divide."""
+    tf = tf.strip()
+    if not tf.endswith('M'):
+        tf = tf.lower()
+    avail = {k: m for k, m in NATIVE_MIN.items() if k in (ex.timeframes or {})} or NATIVE_MIN
+    if tf in avail:
         o = ex.fetch_ohlcv(symbol, timeframe=tf, limit=need)
     else:
         tgt = _tf_to_min(tf)
-        base = max((m for m in NATIVE_MIN.values() if tgt % m == 0 and m < tgt), default=1)
-        base_tf = [k for k, v in NATIVE_MIN.items() if v == base][0]
+        base = max((m for m in avail.values() if tgt % m == 0 and m < tgt), default=1)
+        base_tf = [k for k, v in avail.items() if v == base][0]
         factor = tgt // base
         raw = ex.fetch_ohlcv(symbol, timeframe=base_tf, limit=need * factor + factor)
         df = pd.DataFrame(raw, columns=['t', 'open', 'high', 'low', 'close', 'vol'])
@@ -154,7 +181,7 @@ def build_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | None =
     net = sum(sigs)
     read = "bullish_bias" if net >= 4 else ("bearish_bias" if net <= -4 else "mixed_no_alignment")
     return {
-        "symbol": symbol, "exchange": "binanceusdm",
+        "symbol": symbol, "exchange": ex.id,
         "note": "Datos reales ccxt. Non-native TFs (p.ej. 45m/3h) resampleados desde nativos, anclados a 00:00 UTC.",
         "timeframes": res, "context": ctx,
         "confluence": {"net_score": net, "tfs_counted": len(sigs), "read": read},
@@ -412,31 +439,38 @@ def build_positioning(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m") -> 
     out = {"symbol": symbol, "timeframe": timeframe}
     base = build_ls_oi(symbol, timeframe)
     out.update({k: base.get(k) for k in ("ls_ratio", "long_pct", "short_pct", "oi_usd", "oi_change_pct") if k in base})
-    try:  # smart money: top traders por POSICIONES
-        r = ex.fapiDataGetTopLongShortPositionRatio({"symbol": raw, "period": timeframe, "limit": 2})[-1]
-        out["top_traders_ls"] = round(float(r["longShortRatio"]), 3)
-        out["top_traders_long_pct"] = round(float(r["longAccount"]) * 100, 1)
-        rt = out.get("ls_ratio")
-        if rt:
-            d = out["top_traders_ls"] - rt
-            out["smart_vs_retail"] = ("smart_money_long_retail_short" if d > 0.15
-                                      else ("smart_money_short_retail_long" if d < -0.15 else "aligned"))
-    except Exception as e:
-        out["top_traders_err"] = str(e)[:60]
-    try:  # flujo agresor agregado (ventana del periodo, no 120 trades)
-        r = ex.fapiDataGetTakerlongshortRatio({"symbol": raw, "period": timeframe, "limit": 2})[-1]
-        out["taker_buy_sell_ratio"] = round(float(r["buySellRatio"]), 3)
-        out["taker_read"] = "buyers" if float(r["buySellRatio"]) > 1 else "sellers"
-    except Exception as e:
-        out["taker_err"] = str(e)[:60]
-    try:  # basis + countdown a funding
-        r = ex.fapiPublicGetPremiumIndex({"symbol": raw})
-        mark, idx = float(r["markPrice"]), float(r["indexPrice"])
-        out["basis_bps"] = round((mark - idx) / idx * 1e4, 2)
-        out["basis_read"] = "premium (perp>spot, presión larga)" if mark > idx else "descuento (perp<spot, presión corta)"
-        out["funding_next_pct"] = round(float(r["lastFundingRate"]) * 100, 4)
-        mins = max(0, (int(r["nextFundingTime"]) - int(r["time"])) / 60000)
-        out["funding_countdown_min"] = round(mins)
+    out["venue"] = ex.id
+    if ex.id == "binanceusdm":
+        try:  # smart money: top traders por POSICIONES (endpoint exclusivo Binance)
+            r = ex.fapiDataGetTopLongShortPositionRatio({"symbol": raw, "period": timeframe, "limit": 2})[-1]
+            out["top_traders_ls"] = round(float(r["longShortRatio"]), 3)
+            out["top_traders_long_pct"] = round(float(r["longAccount"]) * 100, 1)
+            rt = out.get("ls_ratio")
+            if rt:
+                d = out["top_traders_ls"] - rt
+                out["smart_vs_retail"] = ("smart_money_long_retail_short" if d > 0.15
+                                          else ("smart_money_short_retail_long" if d < -0.15 else "aligned"))
+        except Exception as e:
+            out["top_traders_err"] = str(e)[:60]
+        try:  # flujo agresor agregado (ventana del periodo, no 120 trades)
+            r = ex.fapiDataGetTakerlongshortRatio({"symbol": raw, "period": timeframe, "limit": 2})[-1]
+            out["taker_buy_sell_ratio"] = round(float(r["buySellRatio"]), 3)
+            out["taker_read"] = "buyers" if float(r["buySellRatio"]) > 1 else "sellers"
+        except Exception as e:
+            out["taker_err"] = str(e)[:60]
+    else:
+        out["top_traders_note"] = f"solo disponible vía Binance (venue actual: {ex.id})"
+    try:  # basis + countdown a funding — UNIFICADO ccxt (funciona en cualquier venue)
+        fr = ex.fetch_funding_rate(symbol)
+        mark, idx = fr.get("markPrice"), fr.get("indexPrice")
+        if mark and idx:
+            out["basis_bps"] = round((mark - idx) / idx * 1e4, 2)
+            out["basis_read"] = "premium (perp>spot, presión larga)" if mark > idx else "descuento (perp<spot, presión corta)"
+        if fr.get("fundingRate") is not None:
+            out["funding_next_pct"] = round(fr["fundingRate"] * 100, 4)
+        ts = fr.get("nextFundingTimestamp") or fr.get("fundingTimestamp")
+        if ts:
+            out["funding_countdown_min"] = max(0, round((ts - time.time() * 1000) / 60000))
     except Exception as e:
         out["premium_err"] = str(e)[:60]
     return out
