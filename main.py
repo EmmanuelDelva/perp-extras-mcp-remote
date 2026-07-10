@@ -39,6 +39,9 @@ ALL_NATIVE = list(NATIVE_MIN.keys())
 VENUES = [v.strip() for v in os.environ.get("PERP_VENUES", "binanceusdm,bybit,okx").split(",") if v.strip()]
 _venue_cache: dict = {}
 _active_venue: list = []
+_venue_errors: dict = {}       # venue -> último error de probe (depurar geo-block sin Shell)
+_last_probe_ts: list = [0.0]   # time.monotonic() del último sondeo completo
+_REPROBE_SECS = 300            # si el activo NO es el preferido, reintenta la cadena cada 5 min
 
 
 def _mk(venue: str):
@@ -52,20 +55,33 @@ def _mk(venue: str):
     return ex
 
 
+def _probe(v):
+    ex = _venue_cache.get(v) or _mk(v)
+    _venue_cache[v] = ex
+    ex.fetch_time()  # geobloqueo/venue caído -> excepción
+    return ex
+
+
 def _ex():
-    if _active_venue:
+    # Reutiliza el venue activo, salvo que NO sea el preferido y ya toque re-sondear:
+    # así un bloqueo TRANSITORIO de binanceusdm no deja el proceso pegado a Bybit para siempre.
+    now = time.monotonic()
+    if _active_venue and (_active_venue[0] == VENUES[0] or now - _last_probe_ts[0] < _REPROBE_SECS):
         return _venue_cache[_active_venue[0]]
+    _last_probe_ts[0] = now
     last = None
     for v in VENUES:
         try:
-            ex = _venue_cache.get(v) or _mk(v)
-            _venue_cache[v] = ex
-            ex.fetch_time()  # geobloqueo/venue caído -> excepción -> siguiente
-            _active_venue.append(v)
+            ex = _probe(v)
+            _venue_errors.pop(v, None)
+            _active_venue[:] = [v]
             return ex
         except Exception as e:
+            _venue_errors[v] = f"{type(e).__name__}: {str(e)[:180]}"
             last = e
-    raise RuntimeError(f"ningún venue vivo en {VENUES}: {str(last)[:80]}")
+    if _active_venue:  # el re-sondeo falló pero ya teníamos un venue vivo -> úsalo
+        return _venue_cache[_active_venue[0]]
+    raise RuntimeError(f"ningún venue vivo en {VENUES}: {str(last)[:120]}")
 
 
 # Rótulo honesto del venue activo (anti-inventos): cada respuesta declara de dónde
@@ -84,7 +100,28 @@ def _venue_meta() -> dict:
             "Funding/OI/L-S son de ESTE venue, no Binance; "
             "top-trader smart-money (Binance-only) no disponible."
         )
+        err = _venue_errors.get("binanceusdm")
+        if err:
+            meta["binance_error"] = err
     return meta
+
+
+def build_venue_health() -> dict:
+    active = _ex().id
+    return {
+        "active_venue": active,
+        "binance": active == "binanceusdm",
+        "chain": VENUES,
+        "reprobe_secs": _REPROBE_SECS,
+        "errors": dict(_venue_errors),
+    }
+
+
+@mcp.tool()
+def venue_health() -> dict:
+    """Diagnóstico de venue: cuál está activo, la cadena de fallback y el último error de probe de
+    cada venue (para depurar el geo-block de Binance sin Shell). Fuerza un re-sondeo si toca."""
+    return build_venue_health()
 
 
 def _tf_to_min(tf: str) -> int:
