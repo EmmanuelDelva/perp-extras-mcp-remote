@@ -68,6 +68,25 @@ def _ex():
     raise RuntimeError(f"ningún venue vivo en {VENUES}: {str(last)[:80]}")
 
 
+# Rótulo honesto del venue activo (anti-inventos): cada respuesta declara de dónde
+# salieron los datos y marca la degradación cuando Binance no está accesible (geo-block).
+_VENUE_LABEL = {"binanceusdm": "Binance USDⓈ-M", "bybit": "Bybit perp", "okx": "OKX swap"}
+
+
+def _venue_meta() -> dict:
+    """Metadatos del venue activo para que cada gatillo NUNCA se rotule 'Binance' si sirve otro."""
+    vid = _ex().id
+    is_binance = vid == "binanceusdm"
+    meta = {"venue": vid, "venue_label": _VENUE_LABEL.get(vid, vid), "binance": is_binance}
+    if not is_binance:
+        meta["degraded"] = (
+            f"⚠️ Binance geo-bloqueado — datos de {_VENUE_LABEL.get(vid, vid)}. "
+            "Funding/OI/L-S son de ESTE venue, no Binance; "
+            "top-trader smart-money (Binance-only) no disponible."
+        )
+    return meta
+
+
 def _tf_to_min(tf: str) -> int:
     tf = tf.strip().lower()
     if tf in NATIVE_MIN:
@@ -434,7 +453,7 @@ def build_trade_plan(symbol: str = "WLD/USDT:USDT", direction: str | None = None
         },
         "context": {"funding_pct": funding, **lsoi},
         "confirmations": checks,
-        "note": "Datos reales Binance futures. ETA = estimación por velocidad ATR (0.6·ATR/vela), no garantía temporal.",
+        "note": f"Datos reales {_ex().id}. ETA = estimación por velocidad ATR (0.6·ATR/vela), no garantía temporal.",
     }
 
 
@@ -741,7 +760,7 @@ def build_wldlive(symbol: str = "WLD/USDT:USDT") -> dict:
     pulse = build_pulse(symbol, 80, 20)
     snap = build_snapshot(symbol, ["15m", "1h", "4h", "1d"])
     return {
-        "trigger": "wldlive", "symbol": symbol, "price": pulse.get("last"),
+        "trigger": "wldlive", "symbol": symbol, **_venue_meta(), "price": pulse.get("last"),
         "confluence": snap["confluence"],
         "tf_signals": {tf: snap["timeframes"][tf].get("signal") for tf in ["15m", "1h", "4h", "1d"]},
         "flow": pulse.get("flow"), "buy_pressure_pct": pulse.get("buy_pressure_pct"),
@@ -751,7 +770,7 @@ def build_wldlive(symbol: str = "WLD/USDT:USDT") -> dict:
 
 def build_wldlivenow(symbol: str = "WLD/USDT:USDT", entry_tf: str = "5m") -> dict:
     """Timing 'ahora': order-flow + libro + plan de scalp en TF corto."""
-    return {"trigger": "wldlivenow", "symbol": symbol,
+    return {"trigger": "wldlivenow", "symbol": symbol, **_venue_meta(),
             "pulse": build_pulse(symbol, 120, 20),
             "plan": build_trade_plan(symbol, None, 1.0, 1000.0, entry_tf)}
 
@@ -759,7 +778,7 @@ def build_wldlivenow(symbol: str = "WLD/USDT:USDT", entry_tf: str = "5m") -> dic
 def build_wldlivefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
                       account_usd: float = 1000.0, entry_tf: str = "15m") -> dict:
     """Análisis completo: snapshot de TODOS los TFs nativos + plan (3 TP/ETA) + order-flow + sentiment objetivo."""
-    return {"trigger": "wldlivefull", "symbol": symbol,
+    return {"trigger": "wldlivefull", "symbol": symbol, **_venue_meta(),
             "snapshot": build_snapshot(symbol),
             "plan": build_trade_plan(symbol, None, risk_pct, account_usd, entry_tf),
             "pulse": build_pulse(symbol, 120, 20),
