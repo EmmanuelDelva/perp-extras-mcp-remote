@@ -14,6 +14,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import os
+import re
 import time
 from pathlib import Path
 import ccxt
@@ -42,6 +43,13 @@ _active_venue: list = []
 _venue_errors: dict = {}       # venue -> último error de probe (depurar geo-block sin Shell)
 _last_probe_ts: list = [0.0]   # time.monotonic() del último sondeo completo
 _REPROBE_SECS = 300            # si el activo NO es el preferido, reintenta la cadena cada 5 min
+_venue_ban_until: dict = {}    # venue -> epoch_s hasta el que Binance lo baneó (418/-1003)
+
+
+def _parse_ban_until(msg: str):
+    """Epoch (s) de un ban 418 de Binance: '...banned until 1783714675643.' (ms) -> segundos."""
+    m = re.search(r"banned until (\d+)", msg)
+    return int(m.group(1)) / 1000.0 if m else None
 
 
 def _mk(venue: str):
@@ -70,7 +78,11 @@ def _ex():
         return _venue_cache[_active_venue[0]]
     _last_probe_ts[0] = now
     last = None
+    wall = time.time()
     for v in VENUES:
+        if _venue_ban_until.get(v, 0) > wall:  # aún baneado -> NO sondear (evita EXTENDER el ban)
+            _venue_errors[v] = f"baneado hasta epoch {int(_venue_ban_until[v])} — no se sondea"
+            continue
         try:
             ex = _probe(v)
             _venue_errors.pop(v, None)
@@ -78,6 +90,9 @@ def _ex():
             return ex
         except Exception as e:
             _venue_errors[v] = f"{type(e).__name__}: {str(e)[:180]}"
+            bu = _parse_ban_until(str(e))
+            if bu:
+                _venue_ban_until[v] = bu  # respeta la ventana de ban en próximos sondeos
             last = e
     if _active_venue:  # el re-sondeo falló pero ya teníamos un venue vivo -> úsalo
         return _venue_cache[_active_venue[0]]
@@ -108,12 +123,14 @@ def _venue_meta() -> dict:
 
 def build_venue_health() -> dict:
     active = _ex().id
+    now = time.time()
     return {
         "active_venue": active,
         "binance": active == "binanceusdm",
         "chain": VENUES,
         "reprobe_secs": _REPROBE_SECS,
         "errors": dict(_venue_errors),
+        "banned_until": {k: int(v) for k, v in _venue_ban_until.items() if v > now},
     }
 
 
@@ -219,7 +236,7 @@ def build_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | None =
         except Exception as e:
             return tf, {"error": str(e)[:80]}
 
-    with cf.ThreadPoolExecutor(max_workers=min(15, len(tfs))) as pool:
+    with cf.ThreadPoolExecutor(max_workers=min(4, len(tfs))) as pool:  # cap: evita el burst que dispara el 418 de Binance
         res = dict(pool.map(work, tfs))
 
     ctx = {}
