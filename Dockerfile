@@ -1,6 +1,6 @@
 FROM python:3.13-slim
 
-# delva-perp-extras MCP — day trading de perpetuos Binance USDT-M (12 tools).
+# delva-perp-extras MCP — day trading de perpetuos Binance USDT-M (18 tools).
 RUN pip install --no-cache-dir "mcp[cli]>=1.6.0" "ccxt>=4.4.75" "pandas>=2.2.3"
 
 WORKDIR /app

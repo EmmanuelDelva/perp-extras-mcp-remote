@@ -2,13 +2,17 @@
 """
 delva-perp-extras — MCP a medida para day trading de perpetuos (Binance USDT-M).
 
-Tools:
-  - multi_tf_snapshot(symbol, timeframes): análisis en paralelo de todos los TFs
-    nativos (y no nativos como 45m/3h vía resampleo determinista), + funding + OI.
-  - resample_ohlcv(symbol, target_tf, limit): velas de un TF no nativo desde
-    velas nativas (45m<-15m, 3h<-1h, etc.), ancladas a época (00:00 UTC).
+18 tools en 6 grupos: análisis (multi_tf_snapshot, resample_ohlcv), posicionamiento
+(long_short_and_oi, positioning), ahora (realtime_pulse), plan (trade_plan), gatillos de la
+skill (wldlive/wldlivenow/wldlivefull + genéricos live/livenow/livefull + watchlist_scan),
+ciclo de trade (trade_open, actualizame, trade_close, journal) y diagnóstico (venue_health).
 
-Fuente real: ccxt.binanceusdm. Sin inventos: dato faltante -> null.
+Resiliencia (v4): cadena de venues binanceusdm→bybit→okx con DEMOCIÓN EN CALIENTE — si el
+venue activo empieza a fallar a media sesión (p.ej. ban 418 de Binance sobre la IP compartida
+de Render), se marca su ventana de ban, se re-sondea la cadena y el builder se reintenta UNA
+vez sobre el siguiente venue vivo. Símbolos laxos ('BTC', 'BTCUSDT') y resolución por venue
+(Binance 1000SHIB ↔ Bybit SHIB1000 ↔ OKX SHIB). Sin inventos: dato faltante -> null,
+degradación siempre rotulada (venue/degraded en cada respuesta).
 """
 from __future__ import annotations
 import concurrent.futures as cf
@@ -50,6 +54,48 @@ def _parse_ban_until(msg: str):
     """Epoch (s) de un ban 418 de Binance: '...banned until 1783714675643.' (ms) -> segundos."""
     m = re.search(r"banned until (\d+)", msg)
     return int(m.group(1)) / 1000.0 if m else None
+
+
+SERVER_BUILD = "2026-07-10 v4.0 (failover en caliente + multi-moneda)"
+
+# Fallo A NIVEL VENUE (ban/geo/caída/red) vs error de símbolo o parámetro. Solo el
+# primero justifica demover el venue activo y reintentar en el siguiente de la cadena.
+_VENUE_FAIL_RE = re.compile(
+    r"418|-1003|banned until|DDoSProtection|RateLimitExceeded|ExchangeNotAvailable"
+    r"|NetworkError|RequestTimeout|restricted location|451|403|502|503",
+    re.I,
+)
+
+
+def _is_venue_failure(e: Exception) -> bool:
+    return bool(_VENUE_FAIL_RE.search(f"{type(e).__name__}: {e}"))
+
+
+def _demote_active(e: Exception) -> bool:
+    """El venue activo empezó a fallar A MEDIA SESIÓN (p.ej. Binance banea la IP con el
+    proceso ya clavado en binanceusdm, que por ser el preferido nunca se re-sondea):
+    registra el error, marca su ventana de ban, suelta el venue y fuerza re-sondeo.
+    Devuelve True si había venue activo que soltar (=> vale reintentar una vez)."""
+    if not _active_venue:
+        return False
+    v = _active_venue[0]
+    _venue_errors[v] = f"{type(e).__name__}: {str(e)[:180]}"
+    bu = _parse_ban_until(str(e))
+    _venue_ban_until[v] = bu or (time.time() + 120)  # sin 'banned until' explícito: castigo corto
+    _active_venue[:] = []
+    _last_probe_ts[0] = 0.0
+    return True
+
+
+def _with_failover(fn):
+    """Ejecuta fn(); si el venue activo falla A NIVEL VENUE, demueve y reintenta UNA vez
+    (el reintento ya corre sobre el siguiente venue vivo de la cadena)."""
+    try:
+        return fn()
+    except Exception as e:
+        if _is_venue_failure(e) and _demote_active(e):
+            return fn()
+        raise
 
 
 def _mk(venue: str):
@@ -103,6 +149,48 @@ def _ex():
 # salieron los datos y marca la degradación cuando Binance no está accesible (geo-block).
 _VENUE_LABEL = {"binanceusdm": "Binance USDⓈ-M", "bybit": "Bybit perp", "okx": "OKX swap"}
 
+def _norm_symbol(symbol: str) -> str:
+    """Acepta formato laxo ('WLD', 'btc', 'BTCUSDT', 'BTC/USDT') y devuelve el unificado
+    ccxt del perp lineal: 'BTC/USDT:USDT'. Los ya-unificados pasan intactos."""
+    s = (symbol or "").strip().upper()
+    if not s:
+        return "WLD/USDT:USDT"
+    if ":" in s:
+        return s
+    if "/" in s:
+        return f"{s}:USDT"
+    if s.endswith("USDT") and len(s) > 4:
+        s = s[:-4]
+    return f"{s}/USDT:USDT"
+
+
+def _resolve_symbol(ex, symbol: str) -> str:
+    """Símbolo tal como existe en el venue ACTIVO. Cubre los renombres de memes entre
+    venues (Binance '1000SHIB' ↔ Bybit 'SHIB1000'). SEGURIDAD DE ESCALA (comité 2026-07-10):
+    solo se cruzan variantes de la MISMA familia de contrato 1000-unidades; NUNCA se mapea
+    en silencio '1000SHIB' -> 'SHIB' (el precio cambia 1000x y contamina stops/sizing).
+    Si ninguna variante segura lista en este venue -> ValueError honesto (no demueve venue)."""
+    symbol = _norm_symbol(symbol)
+    try:
+        if not getattr(ex, "markets", None):  # por INSTANCIA (una fresca post-democión trae markets=None)
+            ex.load_markets()
+    except Exception:
+        return symbol  # sin markets no se puede validar: dejar pasar al error real del fetch
+    if symbol in ex.markets:
+        return symbol
+    base = symbol.split("/")[0]
+    if base.startswith("1000"):
+        cands = [f"{base[4:]}1000"]                # 1000SHIB -> SHIB1000 (misma escala)
+    elif base.endswith("1000"):
+        cands = [f"1000{base[:-4]}"]               # SHIB1000 -> 1000SHIB (misma escala)
+    else:
+        cands = [f"1000{base}", f"{base}1000"]     # atajo 'SHIB' -> contrato canónico (escala visible en symbol y price)
+    for b in cands:
+        alt = f"{b}/USDT:USDT"
+        if alt in ex.markets:
+            return alt
+    raise ValueError(f"{symbol} no listado en {ex.id} (variantes de misma escala probadas: {', '.join(cands)})")
+
 
 def _venue_meta() -> dict:
     """Metadatos del venue activo para que cada gatillo NUNCA se rotule 'Binance' si sirve otro."""
@@ -111,7 +199,8 @@ def _venue_meta() -> dict:
     meta = {"venue": vid, "venue_label": _VENUE_LABEL.get(vid, vid), "binance": is_binance}
     if not is_binance:
         meta["degraded"] = (
-            f"⚠️ Binance geo-bloqueado — datos de {_VENUE_LABEL.get(vid, vid)}. "
+            f"⚠️ Binance no accesible desde este host (geo-block o ban de rate-limit) — "
+            f"datos de {_VENUE_LABEL.get(vid, vid)}. "
             "Funding/OI/L-S son de ESTE venue, no Binance; "
             "top-trader smart-money (Binance-only) no disponible."
         )
@@ -127,6 +216,7 @@ def build_venue_health() -> dict:
     return {
         "active_venue": active,
         "binance": active == "binanceusdm",
+        "build": SERVER_BUILD,
         "chain": VENUES,
         "reprobe_secs": _REPROBE_SECS,
         "errors": dict(_venue_errors),
@@ -222,9 +312,12 @@ def _analyze(df: pd.DataFrame) -> dict:
     }
 
 
-def build_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | None = None) -> dict:
+def build_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | None = None,
+                   light: bool = False) -> dict:
+    """light=True: omite el fetch de OI (presupuesto de requests — p.ej. watchlist_scan)."""
     tfs = timeframes or ALL_NATIVE
     ex = _ex()
+    symbol = _resolve_symbol(ex, symbol)
 
     def work(tf):
         try:
@@ -239,16 +332,26 @@ def build_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | None =
     with cf.ThreadPoolExecutor(max_workers=min(4, len(tfs))) as pool:  # cap: evita el burst que dispara el 418 de Binance
         res = dict(pool.map(work, tfs))
 
+    # Si el 100% de los TFs falló con patrón de fallo-de-venue, el venue murió A MEDIA
+    # SESIÓN (p.ej. ban 418 con el proceso clavado en Binance): raise para que
+    # _with_failover demueva y reintente el snapshot completo en el siguiente venue.
+    errs = [d.get("error", "") for d in res.values() if isinstance(d, dict) and "error" in d]
+    if errs and len(errs) == len(res) and any(_VENUE_FAIL_RE.search(x) for x in errs):
+        raise ccxt.ExchangeNotAvailable(f"{ex.id} caído para {symbol}: {errs[0][:120]}")
+
     ctx = {}
     try:
         ctx["funding_pct"] = round(ex.fetch_funding_rate(symbol).get("fundingRate", 0) * 100, 4)
     except Exception as e:
         ctx["funding_pct"] = None; ctx["funding_err"] = str(e)[:60]
-    try:
-        oi = ex.fetch_open_interest(symbol)
-        ctx["open_interest"] = oi.get("openInterestAmount") or oi.get("openInterestValue")
-    except Exception as e:
-        ctx["open_interest"] = None; ctx["oi_err"] = str(e)[:60]
+    if light:
+        ctx["open_interest"] = None  # omitido a propósito (modo light), no medido
+    else:
+        try:
+            oi = ex.fetch_open_interest(symbol)
+            ctx["open_interest"] = oi.get("openInterestAmount") or oi.get("openInterestValue")
+        except Exception as e:
+            ctx["open_interest"] = None; ctx["oi_err"] = str(e)[:60]
 
     sigs = [d["signal"] for d in res.values() if "signal" in d]
     net = sum(sigs)
@@ -271,17 +374,20 @@ def multi_tf_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | Non
     Devuelve indicadores por TF (RSI, MACD, ATR, EMA20/50/200, Bollinger, vol),
     señal -1/0/+1, funding rate, open interest y score de confluencia.
     """
-    return build_snapshot(symbol, timeframes)
+    return _with_failover(lambda: build_snapshot(symbol, timeframes))
 
 
 @mcp.tool()
 def resample_ohlcv(symbol: str, target_tf: str, limit: int = 100) -> dict:
     """Velas OHLCV de un TF NO nativo (45m, 3h, etc.) resampleadas desde velas nativas de Binance futures."""
-    ex = _ex()
-    df = _fetch_any(ex, symbol, target_tf, limit)
-    return {"symbol": symbol, "target_tf": target_tf, "count": len(df),
-            "candles": df.tail(limit).values.tolist(),
-            "columns": ["timestamp", "open", "high", "low", "close", "volume"]}
+    def _run():
+        ex = _ex()
+        sym = _resolve_symbol(ex, symbol)
+        df = _fetch_any(ex, sym, target_tf, limit)
+        return {"symbol": sym, "target_tf": target_tf, "count": len(df),
+                "candles": df.tail(limit).values.tolist(),
+                "columns": ["timestamp", "open", "high", "low", "close", "volume"]}
+    return _with_failover(_run)
 
 
 # ============================ ITEM 1: Long/Short + Open Interest ============================
@@ -292,6 +398,7 @@ def _raw_symbol(symbol: str) -> str:
 
 def build_ls_oi(symbol: str, timeframe: str = "15m", lookback: int = 24) -> dict:
     ex = _ex()
+    symbol = _resolve_symbol(ex, symbol)
     out = {"symbol": symbol, "timeframe": timeframe}
     try:
         ls = []
@@ -336,7 +443,7 @@ def long_short_and_oi(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m", loo
     """Sentiment OBJETIVO de posicionamiento en Binance Futures: long/short account ratio
     (crowding de retail) + open interest y su cambio en `lookback` periodos.
     Lectura: OI subiendo + precio bajando = shorts tomando control; L/S ratio alto = largos amontonados (riesgo de squeeze)."""
-    return build_ls_oi(symbol, timeframe, lookback)
+    return _with_failover(lambda: build_ls_oi(symbol, timeframe, lookback))
 
 
 # ============================ ITEM 2: Real-time pulse (REST order-flow) ============================
@@ -344,6 +451,7 @@ def long_short_and_oi(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m", loo
 def build_pulse(symbol: str = "WLD/USDT:USDT", trades_n: int = 100, depth: int = 20) -> dict:
     """Order-flow de los últimos trades (REST) + presión del libro. Fiable y portable (sin websocket)."""
     ex = _ex()
+    symbol = _resolve_symbol(ex, symbol)
     try:
         t = ex.fetch_trades(symbol, limit=min(max(trades_n, 20), 500))
         buy = sum(x["amount"] for x in t if x.get("side") == "buy")
@@ -356,6 +464,8 @@ def build_pulse(symbol: str = "WLD/USDT:USDT", trades_n: int = 100, depth: int =
         tps = round(len(t) / span, 1) if span else None
         rr = 4 if last < 1 else (2 if last < 1000 else 1)
     except Exception as e:
+        if _is_venue_failure(e):
+            raise  # que _with_failover demueva el venue y reintente, en vez de error suave
         return {"symbol": symbol, "error": f"trades: {str(e)[:70]}"}
     out = {
         "symbol": symbol, "trades": len(t), "window_s": round(span, 1) if span else None,
@@ -387,7 +497,7 @@ def realtime_pulse(symbol: str = "WLD/USDT:USDT", trades_n: int = 100, depth: in
     """Pulso 'ahora' de un perpetuo Binance: order-flow de los últimos `trades_n` trades
     (presión compradora/vendedora, delta, VWAP, trades/seg) + presión del order book
     (imbalance bid/ask, spread). Para timing de entrada/scalp. Datos REST reales."""
-    return build_pulse(symbol, trades_n, depth)
+    return _with_failover(lambda: build_pulse(symbol, trades_n, depth))
 
 
 # ============================ ITEM 3 (motor): Trade plan con 3 TP + ETA ============================
@@ -405,10 +515,18 @@ def build_trade_plan(symbol: str = "WLD/USDT:USDT", direction: str | None = None
                      risk_pct: float = 1.0, account_usd: float = 1000.0,
                      entry_tf: str = "15m") -> dict:
     ex = _ex()
+    symbol = _resolve_symbol(ex, symbol)
     snap = build_snapshot(symbol, [entry_tf, "1h", "4h", "1d"])
     tfd = snap["timeframes"]
-    price = tfd[entry_tf]["price"]
-    atr_e = tfd[entry_tf]["atr"]
+    entry_d = tfd.get(entry_tf) or {}
+    if "price" not in entry_d:
+        # El TF de entrada vino sin datos (venue degradado, símbolo sin velas, etc.):
+        # error ESTRUCTURADO y honesto — nunca más el KeyError 'price' que tumbaba el gatillo.
+        return {"error": "sin_datos_tf_entrada", "symbol": symbol, "entry_tf": entry_tf,
+                "detail": entry_d.get("error", "sin velas suficientes"), **_venue_meta(),
+                "hint": "reintenta en ~1 min (failover de venue) o usa el fallback TradingView"}
+    price = entry_d["price"]
+    atr_e = entry_d["atr"]
     net = snap["confluence"]["net_score"]
     if direction is None:
         direction = "short" if net < 0 else ("long" if net > 0 else "none")
@@ -518,7 +636,7 @@ def trade_plan(symbol: str = "WLD/USDT:USDT", direction: str | None = None,
     (1R/2R/3R) con % de movimiento y ETA por objetivo, sizing por riesgo, y confirmaciones
     de contexto (funding, long/short ratio, open interest) + señales multi-TF.
     direction: 'long'/'short'/None (auto por confluencia)."""
-    return build_trade_plan(symbol, direction, risk_pct, account_usd, entry_tf)
+    return _with_failover(lambda: build_trade_plan(symbol, direction, risk_pct, account_usd, entry_tf))
 
 
 # ============================ Posicionamiento PRO (smart money / taker / basis / funding countdown) ============================
@@ -526,6 +644,7 @@ def trade_plan(symbol: str = "WLD/USDT:USDT", direction: str | None = None,
 def build_positioning(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m") -> dict:
     """Posicionamiento avanzado Binance Futures: retail vs TOP TRADERS, taker buy/sell, basis y countdown a funding."""
     ex = _ex()
+    symbol = _resolve_symbol(ex, symbol)
     raw = _raw_symbol(symbol)
     out = {"symbol": symbol, "timeframe": timeframe}
     base = build_ls_oi(symbol, timeframe)
@@ -571,7 +690,7 @@ def build_positioning(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m") -> 
 def positioning(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m") -> dict:
     """Posicionamiento PRO de un perp Binance: retail vs TOP TRADERS (smart money), taker buy/sell
     ratio agregado, basis perp-spot y countdown al próximo funding. Complementa long_short_and_oi."""
-    return build_positioning(symbol, timeframe)
+    return _with_failover(lambda: build_positioning(symbol, timeframe))
 
 
 # ============================ Ciclo de vida del trade (entrada -> actualízame -> salida -> journal) ============================
@@ -596,6 +715,7 @@ def build_trade_open(symbol: str, side: str, entry: float, size_units: float | N
                      stop: float | None = None, entry_tf: str = "5m", note: str = "") -> dict:
     """Registra el trade activo (desde captura o precio dicho por el usuario)."""
     ex = _ex()
+    symbol = _resolve_symbol(ex, symbol)
     df = _fetch_any(ex, symbol, entry_tf, 40)
     a = float(_atr(df["high"], df["low"], df["close"]).iloc[-1])
     sign = 1 if side == "long" else -1
@@ -608,6 +728,7 @@ def build_trade_open(symbol: str, side: str, entry: float, size_units: float | N
     trade = {
         "symbol": symbol, "side": side, "entry": entry, "stop": R(stop),
         "initial_stop": R(stop), "risk": risk, "atr_at_open": a, "entry_tf": entry_tf,
+        "venue_at_open": ex.id,  # barrera anti-drift: la gestión valida contra este venue
         "size_units": size_units, "opened_at": int(time.time() * 1000),
         "tps": [R(entry + sign * m * risk) for m in (1, 2, 3)],
         "mfe_r": 0.0, "mae_r": 0.0, "updates": 0, "be_moved": False, "note": note,
@@ -648,6 +769,11 @@ def build_trade_update(note: str = "") -> dict:
     if not t:
         return {"error": "no_hay_trade_activo", "hint": "usa trade_open o el gatillo wldlivenow para buscar entrada"}
     ex = _ex()
+    # Barrera venue_at_open (comité 2026-07-10): si el trade se abrió con precio de un venue
+    # que ya no es el activo, TODO número de este update viene de otro exchange (drift bps
+    # que a 50-75x sí importa) -> se avisa arriba y NO se mueven stops automáticamente.
+    v_open = t.get("venue_at_open")
+    cross_venue = bool(v_open and ex.id != v_open)
     symbol, side, entry, risk = t["symbol"], t["side"], t["entry"], t["risk"]
     sign = 1 if side == "long" else -1
     rr = 4 if entry < 1 else (2 if entry < 1000 else 1)
@@ -655,6 +781,9 @@ def build_trade_update(note: str = "") -> dict:
 
     pulse = build_pulse(symbol, 100, 20)
     px = pulse.get("last") or pulse.get("vwap")
+    if px is None:
+        return {"error": "sin_precio_vivo", "symbol": symbol, "detail": pulse.get("error"),
+                **_venue_meta(), "hint": "reintenta en ~1 min; el trade sigue registrado intacto"}
     snap = build_snapshot(symbol, ["5m", "15m", "1h"])
     pos = build_positioning(symbol, "15m")
 
@@ -677,14 +806,21 @@ def build_trade_update(note: str = "") -> dict:
     if r_now <= -0.8:
         recs.append("⛔ cerca del stop: respétalo, no lo muevas en contra")
     if r_now >= 1 and not t["be_moved"]:
-        t["stop"] = R(entry); t["be_moved"] = True
-        recs.append("✅ +1R alcanzado → stop movido a BREAK-EVEN (riesgo cero)")
+        if cross_venue:
+            recs.append(f"✅ +1R visto (precio de {ex.id}) → mueve TÚ el stop a BE {R(entry)} "
+                        "en tu exchange; no lo muevo automáticamente con precio cruzado")
+        else:
+            t["stop"] = R(entry); t["be_moved"] = True
+            recs.append("✅ +1R alcanzado → stop movido a BREAK-EVEN (riesgo cero)")
     if tps_hit >= 1 and r_now >= 1:
         recs.append(f"💰 TP{tps_hit} tocado → toma parcial si no lo hiciste")
     if r_now >= 2:
-        if new_stop != t["stop"] and ((side == "short" and new_stop < t["stop"]) or (side == "long" and new_stop > t["stop"])):
+        better = new_stop != t["stop"] and ((side == "short" and new_stop < t["stop"]) or (side == "long" and new_stop > t["stop"]))
+        if better and not cross_venue:
             t["stop"] = new_stop
             recs.append(f"🏃 modo runner: trailing ATR ajustado a {new_stop} — deja correr hacia TP3+")
+        elif better and cross_venue:
+            recs.append(f"🏃 modo runner: trailing sugerido {new_stop} (calculado con {ex.id}) — ajústalo TÚ en tu exchange")
         else:
             recs.append("🏃 modo runner: mantén trailing, deja correr")
     flow_against = (pulse.get("flow") == "buyers" and side == "short") or (pulse.get("flow") == "sellers" and side == "long")
@@ -702,26 +838,36 @@ def build_trade_update(note: str = "") -> dict:
     if rev_score >= 4:
         flip_dir = "long" if side == "short" else "short"
         flip = build_trade_plan(symbol, flip_dir, 1.0, 1000.0, "5m")
-        fp = flip["plan"]
         recs.insert(0, f"🔄 CAMBIO DE TENDENCIA REAL ({rev_score}/6): CIERRA EL {side.upper()} AHORA en {px}")
         trend_change = {
             "detected": True, "score": f"{rev_score}/6", "razones": rev_reasons,
             "cerrar_en": px,
-            "setup_contrario_5m": {
+        }
+        fp = flip.get("plan")
+        if fp:  # si el plan del flip degradó (venue sin datos), el aviso de giro sale igual
+            trend_change["setup_contrario_5m"] = {
                 "direccion": flip_dir, "entry": fp["entry"], "stop": fp["stop"],
                 "tps": [(tp["tag"], tp["price"], tp["eta"]) for tp in fp["tps"]],
                 "timing": flip.get("timing"),
-            },
-        }
+            }
+        else:
+            trend_change["setup_contrario_5m"] = {"error": flip.get("error", "sin datos"),
+                                                  "hint": "pide wldlivenow para el setup del flip"}
     elif rev_score >= 2:
         recs.append(f"⚠️ señales de giro ({rev_score}/6): {'; '.join(rev_reasons[:2])} — vigila de cerca")
 
     if not recs:
         recs.append("🕒 en rango: mantén el plan, ni codicia ni pánico")
 
+    if cross_venue:
+        recs.insert(0, f"⚠️ VENUE CRUZADO: tu trade abrió con precio de {v_open}, pero ahora el "
+                       f"precio de referencia es de {ex.id}. Verifica todo número contra TU "
+                       "pantalla antes de actuar; stops NO se mueven automáticamente.")
+
     _save_active(t)
     return {
         "trigger": "actualizame(trade)", "symbol": symbol, "side": side,
+        "venue_now": ex.id, "venue_at_open": v_open, "cross_venue": cross_venue,
         "trend_change": trend_change,
         "entry": entry, "price_now": px, "stop_now": t["stop"], "be_moved": t["be_moved"],
         "pnl_pct": round(sign * (px - entry) / entry * 100, 2),
@@ -742,8 +888,22 @@ def build_trade_close(exit_price: float | None = None, note: str = "") -> dict:
     t = _load_active()
     if not t:
         return {"error": "no_hay_trade_activo"}
+    v_open = t.get("venue_at_open")
+    exit_source = "manual"
     if exit_price is None:
+        cur = _ex().id
+        if v_open and cur != v_open:
+            # Cerrar escribe el journal PERMANENTE: con venue cruzado se exige el fill real
+            # del exchange de Emmanuel — nunca journalear con precio de otro venue (comité).
+            return {"error": "venue_cruzado_sin_precio", **_venue_meta(),
+                    "hint": f"tu trade abrió con precio de {v_open} y ahora solo hay {cur}: "
+                            "pásame tu precio REAL de salida (exit_price, de tu captura/exchange) "
+                            "para journalear sin drift; el trade sigue abierto"}
         exit_price = build_pulse(t["symbol"], 30, 5).get("last")
+        exit_source = cur
+    if exit_price is None:
+        return {"error": "sin_precio_de_cierre", **_venue_meta(),
+                "hint": "no hay precio vivo del venue ahora — pásame exit_price explícito; el trade sigue abierto"}
     sign = 1 if t["side"] == "long" else -1
     r_final = sign * (exit_price - t["entry"]) / t["risk"] if t["risk"] else 0
     entry_dec = 4 if t["entry"] < 1 else (2 if t["entry"] < 1000 else 1)
@@ -756,6 +916,7 @@ def build_trade_close(exit_price: float | None = None, note: str = "") -> dict:
         "pnl_pct": round(sign * (exit_price - t["entry"]) / t["entry"] * 100, 2),
         "r_result": round(r_final, 2), "mfe_r": round(t["mfe_r"], 2), "mae_r": round(t["mae_r"], 2),
         "updates": t["updates"], "size_units": t.get("size_units"),
+        "venue_at_open": v_open, "exit_source": exit_source,
         "note": note or t.get("note", ""),
     }
     with JOURNAL_FILE.open("a", encoding="utf-8") as f:
@@ -774,7 +935,7 @@ def trade_open(symbol: str = "WLD/USDT:USDT", side: str = "short", entry: float 
     Calcula stop estructural (si no se da), 3 TPs (1R/2R/3R) y guarda estado para 'actualízame'."""
     if entry <= 0:
         return {"error": "entry_requerido", "hint": "pasa el precio real de entrada"}
-    return build_trade_open(symbol, side, entry, size_units, stop, entry_tf, note)
+    return _with_failover(lambda: build_trade_open(symbol, side, entry, size_units, stop, entry_tf, note))
 
 
 @mcp.tool()
@@ -783,15 +944,15 @@ def actualizame(symbol: str = "WLD/USDT:USDT") -> dict:
     trailing ATR, TPs, order-flow, funding countdown, recomendaciones para maximizar). Si NO hay
     trade → corre wldlivenow para buscar la mejor entrada."""
     if _load_active():
-        return build_trade_update()
-    return {"trigger": "actualizame(sin_trade)", **build_wldlivenow(symbol)}
+        return _with_failover(build_trade_update)
+    return {"trigger": "actualizame(sin_trade)", **_with_failover(lambda: build_wldlivenow(symbol))}
 
 
 @mcp.tool()
 def trade_close(exit_price: float | None = None, note: str = "") -> dict:
     """Cierra el trade activo (a precio dado o al precio de mercado actual), calcula resultado
     (R, %PnL, eficiencia vs MFE) y lo registra en el journal automáticamente."""
-    return build_trade_close(exit_price, note)
+    return _with_failover(lambda: build_trade_close(exit_price, note))
 
 
 @mcp.tool()
@@ -807,10 +968,80 @@ def journal(limit: int = 10) -> dict:
             "total_r": round(sum(t["r_result"] for t in trades), 2)}
 
 
+# ============================ Watchlist scan — radar multi-moneda T1/T2/T3 ============================
+
+# Formato: "SIMBOLO:TIER,..." — override por env var sin redeploy de código.
+WATCHLIST = [w.strip() for w in os.environ.get(
+    "PERP_WATCHLIST",
+    "WLD:T1,BTC:T2,ETH:T2,SOL:T2,FET:T2,GMT:T3,1000SHIB:T3,1000FLOKI:T3,GALA:T3",
+).split(",") if w.strip()]
+
+
+def build_watchlist_scan(symbols: list[str] | None = None, timeframes: list[str] | None = None) -> dict:
+    # LEAN a propósito (comité 2026-07-10): 3 TFs + funding, SIN OI por moneda — un barrido de
+    # 9 símbolos es acelerante de rate-limit sobre la IP compartida; cada request cuenta.
+    tfs = timeframes or ["15m", "1h", "4h"]
+    if symbols:
+        pairs = [(s, "") for s in symbols]
+    else:
+        pairs = [tuple(w.split(":", 1)) if ":" in w else (w, "") for w in WATCHLIST]
+
+    def scan_one(pair):
+        sym, tier = pair
+        row = {"tier": tier or None}
+        try:
+            snap = _with_failover(lambda: build_snapshot(sym, tfs, light=True))
+            t0 = snap["timeframes"].get(tfs[0]) or {}
+            n = snap["confluence"]["net_score"]
+            k = max(snap["confluence"]["tfs_counted"], 1)
+            row.update({
+                "symbol": snap["symbol"], "price": t0.get("price"),
+                "net_score": n, "tfs_counted": k, "read": snap["confluence"]["read"],
+                "alineacion_pct": round(abs(n) / k * 100),
+                "lado": "long" if n > 0 else ("short" if n < 0 else "neutro"),
+                "tf_signals": {tf: (snap["timeframes"].get(tf) or {}).get("signal") for tf in tfs},
+                "funding_pct": snap["context"].get("funding_pct"),
+            })
+        except Exception as e:
+            row.update({"symbol": _norm_symbol(sym), "error": str(e)[:100]})
+        return row
+
+    with cf.ThreadPoolExecutor(max_workers=2) as pool:  # bajo a propósito: 9 símbolos sin disparar rate-limits
+        rows = list(pool.map(scan_one, pairs))
+
+    ok = [r for r in rows if "net_score" in r]
+    ok.sort(key=lambda r: r["alineacion_pct"], reverse=True)
+    err = [r for r in rows if "net_score" not in r]
+    top = ok[0] if ok else None
+    return {
+        "trigger": "watchlist_scan", **_venue_meta(), "timeframes": tfs,
+        "ranking": ok + err,
+        "mejor_candidato": (
+            {"symbol": top["symbol"], "lado": top["lado"], "alineacion_pct": top["alineacion_pct"],
+             "hint": f"pide livenow {top['symbol'].split('/')[0]} para el plan de entrada"}
+            if top and top["alineacion_pct"] >= 75 else None
+        ),
+        "note": ("Radar de confluencia por símbolo (señal -1/0/+1 por TF sobre "
+                 f"{'/'.join(tfs)}). La política de riesgo/sizing por tier vive en la skill; "
+                 "esto es datos, no recomendación."),
+    }
+
+
+@mcp.tool()
+def watchlist_scan(symbols: list[str] | None = None, timeframes: list[str] | None = None) -> dict:
+    """Radar multi-moneda de la watchlist T1/T2/T3 en UNA llamada: por símbolo trae precio,
+    señales por TF (default lean: 15m/1h/4h), confluencia neta y funding; devuelve ranking por
+    fuerza de alineación + mejor candidato. symbols opcional y laxo ('BTC','SOL','1000SHIB');
+    default = watchlist completa WLD·BTC·ETH·SOL·FET·GMT·1000SHIB·1000FLOKI·GALA (env PERP_WATCHLIST).
+    Para profundizar en un candidato: livenow/livefull {moneda}."""
+    return build_watchlist_scan(symbols, timeframes)
+
+
 # ============================ TRIGGERS de la skill (wldlive / wldlivenow / wldlivefull) ============================
 
 def build_wldlive(symbol: str = "WLD/USDT:USDT") -> dict:
     """Vistazo rápido: precio, confluencia 4-TF, order-flow y funding."""
+    symbol = _norm_symbol(symbol)
     pulse = build_pulse(symbol, 80, 20)
     snap = build_snapshot(symbol, ["15m", "1h", "4h", "1d"])
     return {
@@ -824,6 +1055,7 @@ def build_wldlive(symbol: str = "WLD/USDT:USDT") -> dict:
 
 def build_wldlivenow(symbol: str = "WLD/USDT:USDT", entry_tf: str = "5m") -> dict:
     """Timing 'ahora': order-flow + libro + plan de scalp en TF corto."""
+    symbol = _norm_symbol(symbol)
     return {"trigger": "wldlivenow", "symbol": symbol, **_venue_meta(),
             "pulse": build_pulse(symbol, 120, 20),
             "plan": build_trade_plan(symbol, None, 1.0, 1000.0, entry_tf)}
@@ -832,6 +1064,7 @@ def build_wldlivenow(symbol: str = "WLD/USDT:USDT", entry_tf: str = "5m") -> dic
 def build_wldlivefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
                       account_usd: float = 1000.0, entry_tf: str = "15m") -> dict:
     """Análisis completo: snapshot de TODOS los TFs nativos + plan (3 TP/ETA) + order-flow + sentiment objetivo."""
+    symbol = _norm_symbol(symbol)
     return {"trigger": "wldlivefull", "symbol": symbol, **_venue_meta(),
             "snapshot": build_snapshot(symbol),
             "plan": build_trade_plan(symbol, None, risk_pct, account_usd, entry_tf),
@@ -842,13 +1075,13 @@ def build_wldlivefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
 @mcp.tool()
 def wldlive(symbol: str = "WLD/USDT:USDT") -> dict:
     """Gatillo wldlive — vistazo rápido de un perp: precio, confluencia multi-TF, order-flow y funding."""
-    return build_wldlive(symbol)
+    return _with_failover(lambda: build_wldlive(symbol))
 
 
 @mcp.tool()
 def wldlivenow(symbol: str = "WLD/USDT:USDT", entry_tf: str = "5m") -> dict:
     """Gatillo wldlivenow — timing de entrada AHORA: order-flow REST + presión de libro + plan de scalp en TF corto."""
-    return build_wldlivenow(symbol, entry_tf)
+    return _with_failover(lambda: build_wldlivenow(symbol, entry_tf))
 
 
 @mcp.tool()
@@ -856,7 +1089,40 @@ def wldlivefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
                 account_usd: float = 1000.0, entry_tf: str = "15m") -> dict:
     """Gatillo wldlivefull — análisis completo de un perp: todos los TFs nativos, plan de trade
     (entrada/stop/3 TP/ETA), sizing por riesgo, sentiment objetivo (funding, L/S, OI) y order-flow."""
-    return build_wldlivefull(symbol, risk_pct, account_usd, entry_tf)
+    return _with_failover(lambda: build_wldlivefull(symbol, risk_pct, account_usd, entry_tf))
+
+
+# ============================ Gatillos GENÉRICOS multi-moneda (v4) ============================
+# Los mismos motores que wldlive/wldlivenow/wldlivefull, con nombre agnóstico para operar
+# cualquier perp de la watchlist ("live BTC", "livenow SOL", "livefull 1000SHIB"...).
+# Los wld* se conservan por compatibilidad con la skill v3.4.1 y la memoria muscular.
+
+@mcp.tool()
+def live(symbol: str = "WLD/USDT:USDT") -> dict:
+    """Gatillo live {moneda} — vistazo rápido de CUALQUIER perp de la watchlist: precio,
+    confluencia multi-TF, order-flow y funding. Símbolo laxo OK: 'BTC', 'btcusdt', '1000SHIB'."""
+    r = _with_failover(lambda: build_wldlive(symbol))
+    r["trigger"] = "live"
+    return r
+
+
+@mcp.tool()
+def livenow(symbol: str = "WLD/USDT:USDT", entry_tf: str = "5m") -> dict:
+    """Gatillo livenow {moneda} — timing de entrada AHORA para CUALQUIER perp: order-flow +
+    presión de libro + plan de scalp en TF corto. Símbolo laxo OK ('BTC', 'FET', 'GALA')."""
+    r = _with_failover(lambda: build_wldlivenow(symbol, entry_tf))
+    r["trigger"] = "livenow"
+    return r
+
+
+@mcp.tool()
+def livefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
+             account_usd: float = 1000.0, entry_tf: str = "15m") -> dict:
+    """Gatillo livefull {moneda} — análisis completo de CUALQUIER perp: todos los TFs nativos,
+    plan (entrada/stop/3 TP/ETA), sizing por riesgo, positioning y order-flow. Símbolo laxo OK."""
+    r = _with_failover(lambda: build_wldlivefull(symbol, risk_pct, account_usd, entry_tf))
+    r["trigger"] = "livefull"
+    return r
 
 
 def main():
