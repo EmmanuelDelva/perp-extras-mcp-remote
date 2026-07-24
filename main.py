@@ -19,7 +19,9 @@ import concurrent.futures as cf
 import json
 import os
 import re
+import threading
 import time
+import urllib.request
 from pathlib import Path
 import ccxt
 import pandas as pd
@@ -56,7 +58,9 @@ def _parse_ban_until(msg: str):
     return int(m.group(1)) / 1000.0 if m else None
 
 
-SERVER_BUILD = "2026-07-10 v4.0 (failover en caliente + multi-moneda)"
+SERVER_BUILD = ("2026-07 v5.1 (analisis Binance-o-nada · velas cerradas · TP estructural "
+                "8·ATR · cuantizacion a TICK real · funding base-8h intervalo real · "
+                "MMR/cum real por bracket · 3 series L/S con edad · post-auditoria 32 fixes)")
 
 # Fallo A NIVEL VENUE (ban/geo/caída/red) vs error de símbolo o parámetro. Solo el
 # primero justifica demover el venue activo y reintentar en el siguiente de la cadena.
@@ -89,13 +93,109 @@ def _demote_active(e: Exception) -> bool:
 
 def _with_failover(fn):
     """Ejecuta fn(); si el venue activo falla A NIVEL VENUE, demueve y reintenta UNA vez
-    (el reintento ya corre sobre el siguiente venue vivo de la cadena)."""
+    (el reintento ya corre sobre el siguiente venue vivo de la cadena).
+
+    v5: SOLO para el ciclo de trade (actualizame con trade abierto, trade_open,
+    trade_close), donde un precio de otro venue con la barrera venue_at_open es mejor
+    que nada. Las tools de ANALISIS ya no pasan por aqui — usan _analisis_binance."""
     try:
         return fn()
     except Exception as e:
         if _is_venue_failure(e) and _demote_active(e):
             return fn()
         raise
+
+
+# ============================ v5: contrato Binance-o-nada para ANALISIS ============================
+# Leccion del incidente 2026-07-20: wldlivefull sirvio L/S de Bybit (2.21, "retail
+# amontonado") cuando Binance real daba 1.03 (neutro) — lectura INVERTIDA con la misma
+# confianza, y costo dinero. Para ANALISIS, sin dato es sin dato: jamas se sustituye
+# por otro exchange. El failover queda solo para gestionar un trade YA abierto.
+
+class BinanceNoDisponible(Exception):
+    pass
+
+
+_solo_binance = threading.local()
+_strict_probe_ts = [0.0]        # ultimo probe estricto OK (monotonic)
+_STRICT_PROBE_TTL = 120         # con probe fresco, _ex() estricto NO re-pinga:
+#                                 wldlivefull llama _ex() ~9 veces y cada fetch_time
+#                                 extra era peso y latencia sin informacion nueva
+
+
+def _binance_estricto():
+    """Binance o excepcion. Respeta la ventana de ban conocida ANTES de golpear la API.
+    Distingue BAN REAL (418/-1003 con 'banned until') de fallo transitorio: un timeout
+    no es un ban y el mensaje no debe afirmar que lo es."""
+    bu = _venue_ban_until.get("binanceusdm", 0)
+    if bu > time.time():
+        err_reg = _venue_errors.get("binanceusdm", "")
+        es_ban_real = "banned until" in err_reg or "418" in err_reg or "-1003" in err_reg
+        etiqueta = "IP baneada por Binance" if es_ban_real else \
+                   "Binance en castigo temporal tras fallo (no confirmado como ban)"
+        raise BinanceNoDisponible(
+            f"{etiqueta} hasta epoch {int(bu)} "
+            f"({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(bu))})")
+    ex = _venue_cache.get("binanceusdm")
+    if ex is not None and time.monotonic() - _strict_probe_ts[0] < _STRICT_PROBE_TTL:
+        return ex                       # probe fresco: no re-pingar en cada _ex()
+    try:
+        ex = _probe("binanceusdm")
+        _strict_probe_ts[0] = time.monotonic()
+        return ex
+    except Exception as e:
+        _venue_errors["binanceusdm"] = f"{type(e).__name__}: {str(e)[:180]}"
+        b = _parse_ban_until(str(e))
+        if b:
+            _venue_ban_until["binanceusdm"] = b
+        raise BinanceNoDisponible(f"{type(e).__name__}: {str(e)[:160]}")
+
+
+def _err_binance(e) -> dict:
+    """Respuesta estructurada y honesta cuando Binance no esta. NUNCA datos de otro venue."""
+    out = {
+        "error": "binance_no_disponible",
+        "binance": False,
+        "venue": None,
+        "detalle": str(e)[:180],
+        "politica": ("ANALISIS Binance-o-nada (v5): sin dato es sin dato. No se sustituye "
+                     "por Bybit/OKX — un numero de otro venue rotulado como Binance ya "
+                     "costo dinero real (incidente 2026-07-20)."),
+        "alternativas": ["instancia LOCAL del MCP (IP de casa, sin ban)",
+                         "disparador_futuros.py / verificador.py en el repo",
+                         "esperar el fin del ban y reintentar"],
+    }
+    bu = _venue_ban_until.get("binanceusdm", 0)
+    if bu > time.time():
+        out["banned_until_utc"] = time.strftime("%Y-%m-%d %H:%M", time.gmtime(bu))
+        out["ban_restante_min"] = round((bu - time.time()) / 60)
+    return out
+
+
+def _analisis_binance(fn):
+    """Wrapper de las tools de ANALISIS: fuerza Binance en _ex() para este hilo, y si
+    Binance falla devuelve el error estructurado en vez de degradar a otro venue.
+
+    Restaura el valor PREVIO del flag (no lo apaga a ciegas): una llamada anidada
+    (p.ej. el flip de actualizame) apagaba el modo del llamador y el resto de su
+    trabajo fugaba al failover en silencio."""
+    prev = getattr(_solo_binance, "on", False)
+    _solo_binance.on = True
+    try:
+        return fn()
+    except BinanceNoDisponible as e:
+        return _err_binance(e)
+    except Exception as e:
+        if _is_venue_failure(e):
+            _venue_errors["binanceusdm"] = f"{type(e).__name__}: {str(e)[:180]}"
+            b = _parse_ban_until(str(e))
+            # sin 'banned until' explicito NO es un ban confirmado: castigo corto y
+            # el mensaje de _binance_estricto lo rotula como transitorio
+            _venue_ban_until["binanceusdm"] = b or (time.time() + 120)
+            return _err_binance(e)
+        raise
+    finally:
+        _solo_binance.on = prev
 
 
 def _mk(venue: str):
@@ -117,6 +217,9 @@ def _probe(v):
 
 
 def _ex():
+    # v5: en modo analisis (this thread) SOLO Binance — sin cadena, sin democion.
+    if getattr(_solo_binance, "on", False):
+        return _binance_estricto()
     # Reutiliza el venue activo, salvo que NO sea el preferido y ya toque re-sondear:
     # así un bloqueo TRANSITORIO de binanceusdm no deja el proceso pegado a Bybit para siempre.
     now = time.monotonic()
@@ -211,23 +314,57 @@ def _venue_meta() -> dict:
 
 
 def build_venue_health() -> dict:
-    active = _ex().id
+    """v5: diagnostico HONESTO. El v4 certificaba salud con fetch_time() (peso 1) — pasaba
+    aunque la carga real (~200 de peso) estuviera baneada, y reporto 'binance:true /
+    banned_until:{}' mientras wldlivefull servia Bybit. Ahora el probe es REPRESENTATIVO:
+    velas + un endpoint /futures/data (la clase de carga que de verdad usan las tools)."""
     now = time.time()
-    return {
-        "active_venue": active,
-        "binance": active == "binanceusdm",
+    out = {
         "build": SERVER_BUILD,
-        "chain": VENUES,
+        "politica_analisis": "Binance-o-nada (v5): las tools de analisis NUNCA degradan a otro venue",
+        "politica_trade": "ciclo de trade conserva failover con barrera venue_at_open",
         "reprobe_secs": _REPROBE_SECS,
         "errors": dict(_venue_errors),
         "banned_until": {k: int(v) for k, v in _venue_ban_until.items() if v > now},
     }
+    # probe representativo, con el MISMO camino que usan las tools de analisis
+    _prev_flag = getattr(_solo_binance, "on", False)
+    _solo_binance.on = True
+    try:
+        ex = _ex()
+        ex.fetch_ohlcv("WLD/USDT:USDT", timeframe="15m", limit=3)
+        ex.fapiDataGetGlobalLongShortAccountRatio({"symbol": "WLDUSDT", "period": "1h", "limit": 1})
+        out["binance_analisis"] = "OK (velas + futures/data respondieron)"
+        out["binance"] = True
+    except BinanceNoDisponible as e:
+        out["binance_analisis"] = f"NO DISPONIBLE: {str(e)[:140]}"
+        out["binance"] = False
+        # refrescar la ventana de ban en ESTA respuesta (el snapshot temprano podia
+        # decir banned_until vacio junto a un NO DISPONIBLE recien descubierto)
+        out["banned_until"] = {k: int(v) for k, v in _venue_ban_until.items()
+                               if v > time.time()}
+    except Exception as e:
+        out["binance_analisis"] = f"FALLA en carga representativa: {type(e).__name__}: {str(e)[:120]}"
+        out["binance"] = False
+        if _is_venue_failure(e):
+            b = _parse_ban_until(str(e))
+            _venue_ban_until["binanceusdm"] = b or (time.time() + 120)
+            out["banned_until"]["binanceusdm"] = int(_venue_ban_until["binanceusdm"])
+    finally:
+        _solo_binance.on = _prev_flag
+    # el venue del ciclo de trade (con failover) se reporta aparte y rotulado
+    try:
+        out["venue_ciclo_trade"] = _ex().id
+    except Exception as e:
+        out["venue_ciclo_trade"] = f"ninguno vivo: {str(e)[:80]}"
+    return out
 
 
 @mcp.tool()
 def venue_health() -> dict:
-    """Diagnóstico de venue: cuál está activo, la cadena de fallback y el último error de probe de
-    cada venue (para depurar el geo-block de Binance sin Shell). Fuerza un re-sondeo si toca."""
+    """Diagnóstico HONESTO de venue (v5): prueba Binance con una carga REPRESENTATIVA
+    (velas + /futures/data, no un ping barato), reporta bans activos y separa la política
+    de análisis (Binance-o-nada) de la del ciclo de trade (failover con barrera)."""
     return build_venue_health()
 
 
@@ -281,7 +418,16 @@ def _atr(h, l, c, n=14):
     return tr.ewm(alpha=1/n, adjust=False).mean()
 
 
-def _analyze(df: pd.DataFrame) -> dict:
+def _analyze(df: pd.DataFrame, ya_cerradas: bool = False) -> dict:
+    """v5: TODOS los indicadores sobre velas CERRADAS. ccxt devuelve la vela en
+    formacion como ultima fila; evaluarla como 'cierre' hacia que RSI/EMA/señal
+    cambiaran tick a tick y afirmaba cierres que aun podian revertirse (misma clase
+    de bug que el 2º pase adversarial encontro en el disparador). El campo 'price'
+    sigue siendo el precio VIVO (para entradas); todo lo demas es de vela cerrada."""
+    px_vivo = float(df['close'].iloc[-1])
+    if not ya_cerradas and len(df) > 1:
+        df = df.iloc[:-1]          # TFs RESAMPLEADOS ya llegan sin bucket incompleto:
+    #                                recortar otra vez dejaba 'price' un bucket entero viejo
     c, h, l, v = df['close'], df['high'], df['low'], df['vol']
     n = len(df); px = float(c.iloc[-1])
     e20 = float(_ema(c, 20).iloc[-1])
@@ -301,7 +447,8 @@ def _analyze(df: pd.DataFrame) -> dict:
     if r <= 30: sc += 1
     sig = 1 if sc >= 2 else (-1 if sc <= -2 else 0)
     return {
-        "price": round(px, 6), "rsi": round(r, 1), "macd_hist": round(hist, 6),
+        "price": round(px_vivo, 6), "close_confirmado": round(px, 6),
+        "rsi": round(r, 1), "macd_hist": round(hist, 6),
         "macd_dir": "up" if hist > 0 else "down", "atr": round(a, 6),
         "atr_pct": round(a / px * 100, 2),
         "ema20": round(e20, 6), "ema50": round(e50, 6) if e50 else None,
@@ -324,7 +471,11 @@ def build_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | None =
             df = _fetch_any(ex, symbol, tf, 210)
             if len(df) < 30:
                 return tf, {"error": f"solo {len(df)} velas"}
-            d = _analyze(df); d["native"] = tf.lower() in NATIVE_MIN
+            es_nativo = tf.lower() in NATIVE_MIN
+            d = _analyze(df, ya_cerradas=not es_nativo)
+            d["native"] = es_nativo
+            if not es_nativo:
+                d["price_es_cierre"] = True   # en resampleados 'price' es el ultimo CIERRE
             return tf, d
         except Exception as e:
             return tf, {"error": str(e)[:80]}
@@ -373,8 +524,9 @@ def multi_tf_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | Non
       Acepta no-nativos ('45m','3h') que se resamplean automáticamente.
     Devuelve indicadores por TF (RSI, MACD, ATR, EMA20/50/200, Bollinger, vol),
     señal -1/0/+1, funding rate, open interest y score de confluencia.
+    Indicadores sobre velas CERRADAS; 'price' es el precio vivo. Binance-o-nada.
     """
-    return _with_failover(lambda: build_snapshot(symbol, timeframes))
+    return _analisis_binance(lambda: build_snapshot(symbol, timeframes))
 
 
 @mcp.tool()
@@ -387,7 +539,7 @@ def resample_ohlcv(symbol: str, target_tf: str, limit: int = 100) -> dict:
         return {"symbol": sym, "target_tf": target_tf, "count": len(df),
                 "candles": df.tail(limit).values.tolist(),
                 "columns": ["timestamp", "open", "high", "low", "close", "volume"]}
-    return _with_failover(_run)
+    return _analisis_binance(_run)
 
 
 # ============================ ITEM 1: Long/Short + Open Interest ============================
@@ -420,7 +572,10 @@ def build_ls_oi(symbol: str, timeframe: str = "15m", lookback: int = 24) -> dict
             out["long_pct"] = round(float(long_acc) * 100, 2)
         if short_acc:
             out["short_pct"] = round(float(short_acc) * 100, 2)
-        out["ls_prev"] = round(float(ls[0]["longShortRatio"]), 4)
+        out["ls_prev"] = round(float(ls[-2]["longShortRatio"]), 4) if len(ls) > 1 else None
+        ts_ls = ls[-1].get("timestamp")
+        if ts_ls:
+            out["ls_edad_min"] = round((time.time() - ts_ls / 1000) / 60, 1)
     except Exception as e:
         out["ls_error"] = str(e)[:70]
     try:
@@ -443,7 +598,7 @@ def long_short_and_oi(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m", loo
     """Sentiment OBJETIVO de posicionamiento en Binance Futures: long/short account ratio
     (crowding de retail) + open interest y su cambio en `lookback` periodos.
     Lectura: OI subiendo + precio bajando = shorts tomando control; L/S ratio alto = largos amontonados (riesgo de squeeze)."""
-    return _with_failover(lambda: build_ls_oi(symbol, timeframe, lookback))
+    return _analisis_binance(lambda: build_ls_oi(symbol, timeframe, lookback))
 
 
 # ============================ ITEM 2: Real-time pulse (REST order-flow) ============================
@@ -459,18 +614,17 @@ def build_pulse(symbol: str = "WLD/USDT:USDT", trades_n: int = 100, depth: int =
         total = buy + sell
         pv = sum(x["price"] * x["amount"] for x in t)
         qv = sum(x["amount"] for x in t)
-        last = float(t[-1]["price"])
+        last = float(t[-1]["price"])   # precio de trade REAL: ya esta sobre tick, no se re-redondea
         span = (t[-1]["timestamp"] - t[0]["timestamp"]) / 1000.0 if len(t) > 1 else None
         tps = round(len(t) / span, 1) if span else None
-        rr = 4 if last < 1 else (2 if last < 1000 else 1)
     except Exception as e:
         if _is_venue_failure(e):
             raise  # que _with_failover demueva el venue y reintente, en vez de error suave
         return {"symbol": symbol, "error": f"trades: {str(e)[:70]}"}
     out = {
         "symbol": symbol, "trades": len(t), "window_s": round(span, 1) if span else None,
-        "trades_per_s": tps, "last": round(last, rr),
-        "vwap": round(pv / qv, rr) if qv else None,
+        "trades_per_s": tps, "last": last,
+        "vwap": _q(ex, symbol, pv / qv) if qv else None,
         "buy_vol": round(buy, 3), "sell_vol": round(sell, 3),
         "delta": round(buy - sell, 3),
         "buy_pressure_pct": round(buy / total * 100, 1) if total else None,
@@ -497,10 +651,154 @@ def realtime_pulse(symbol: str = "WLD/USDT:USDT", trades_n: int = 100, depth: in
     """Pulso 'ahora' de un perpetuo Binance: order-flow de los últimos `trades_n` trades
     (presión compradora/vendedora, delta, VWAP, trades/seg) + presión del order book
     (imbalance bid/ask, spread). Para timing de entrada/scalp. Datos REST reales."""
-    return _with_failover(lambda: build_pulse(symbol, trades_n, depth))
+    return _analisis_binance(lambda: build_pulse(symbol, trades_n, depth))
 
 
 # ============================ ITEM 3 (motor): Trade plan con 3 TP + ETA ============================
+# v5: criterios portados del disparador auditado (3 pases adversariales):
+#  - TP desde ESTRUCTURA (pivotes por delante, escalando a TF superior), nunca 1R/2R/3R
+#    mecanico: eso hacia el R:R circular y siempre-igual.
+#  - funding con INTERVALO REAL del simbolo (447 de 731 perps no son 8h) normalizado a
+#    base 8h (la base en que la skill define los tiers 0.03/0.08) y como COSTO del
+#    horizonte descontado del R neto.
+#  - MMR REAL por bracket (espejo publico; el 0.5% de datos-volatiles.md estaba mal:
+#    WLD real = 1.0%) -> lev max por stop + liquidacion TEORICA (cuenta PM liquida por
+#    uniMMR a nivel de cuenta, se rotula siempre).
+#  - direccion solo con alineacion suficiente; sin ella NO se emite plan (el v4 producia
+#    un plan degenerado con entry=stop=TP cuando direction='none').
+
+FUNDING_OK_8H, FUNDING_PROHIBITIVO_8H = 0.03, 0.08
+_FINFO_CACHE: dict = {"ts": 0.0, "map": {}}
+_BRK_CACHE: dict = {"ts": 0.0, "map": {}}
+
+
+def _funding_interval_h(raw: str) -> float:
+    """Horas entre cobros de funding del simbolo. Cache 24h. Default 8 si no listado.
+    Respeta la ventana de ban de fapi (mismo host) y ROTULA cuando degrada: un 8h
+    silencioso en un perp de 4h es un costo de funding 2x mal sin que nadie lo vea."""
+    if time.time() - _FINFO_CACHE["ts"] > 86400:
+        if _venue_ban_until.get("binanceusdm", 0) > time.time():
+            _FINFO_CACHE["fuente"] = "default-8h (fapi en ban: no se consulto)"
+            _FINFO_CACHE["ts"] = time.time() - 82800
+        else:
+            try:
+                req = urllib.request.Request("https://fapi.binance.com/fapi/v1/fundingInfo",
+                                             headers={"User-Agent": "perp-extras/5.1"})
+                data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+                _FINFO_CACHE["map"] = {d["symbol"]: float(d.get("fundingIntervalHours", 8))
+                                       for d in data if d.get("symbol")}
+                _FINFO_CACHE["ts"] = time.time()
+                _FINFO_CACHE["fuente"] = "fundingInfo"
+            except Exception as e:
+                _FINFO_CACHE["fuente"] = f"default-8h (fundingInfo fallo: {type(e).__name__})"
+                _FINFO_CACHE["ts"] = time.time() - 82800  # reintenta en 1h, no martillea
+    return _FINFO_CACHE["map"].get(raw, 8.0)
+
+
+def _funding_interval_fuente(raw: str) -> str:
+    if raw in _FINFO_CACHE.get("map", {}):
+        return "fundingInfo"
+    return _FINFO_CACHE.get("fuente", "default-8h")
+
+
+def _brackets_de(raw: str) -> list:
+    """Brackets reales (MMR/cum/maxLev) del espejo publico. /fapi/v1/leverageBracket es
+    firmado; este espejo trae los ~978 simbolos sin auth. Cache 24h."""
+    if time.time() - _BRK_CACHE["ts"] > 86400:
+        if _venue_ban_until.get("binanceusdm", 0) > time.time() and not _BRK_CACHE["map"]:
+            return []          # en ban y sin cache: no martillear tampoco al espejo
+        try:
+            url = "https://www.binance.com/bapi/futures/v1/friendly/future/common/brackets"
+            req = urllib.request.Request(url, headers={"User-Agent": "perp-extras/5.0"})
+            raw_d = json.loads(urllib.request.urlopen(req, timeout=25).read())
+            data = raw_d.get("data", raw_d) if isinstance(raw_d, dict) else raw_d
+            lista = data.get("brackets", data) if isinstance(data, dict) else data
+            _BRK_CACHE["map"] = {s.get("symbol"): s.get("riskBrackets", []) for s in lista}
+            _BRK_CACHE["ts"] = time.time()
+        except Exception:
+            _BRK_CACHE["ts"] = time.time() - 82800
+    return _BRK_CACHE["map"].get(raw, [])
+
+
+def _bracket_para(raw: str, notional: float) -> dict | None:
+    for b in _brackets_de(raw):
+        lo = float(b.get("bracketNotionalFloor", 0) or 0)
+        hi = float(b.get("bracketNotionalCap", 0) or 1e18)
+        if lo <= notional <= hi:
+            return {"seq": b.get("bracketSeq"), "mmr": float(b.get("bracketMaintenanceMarginRate", 0)),
+                    "cum": float(b.get("cumFastMaintenanceAmount", 0) or 0),
+                    "max_lev": int(b.get("maxOpenPosLeverage", 1))}
+    return None
+
+
+def _pivotes(df: pd.DataFrame, k: int = 3) -> tuple[list, list]:
+    """Pivotes clasicos con k velas a cada lado, sobre el df TAL CUAL se pasa
+    (el llamador decide si recorta la vela viva)."""
+    hs, ls = df["high"].tolist(), df["low"].tolist()
+    altos, bajos = [], []
+    for i in range(k, len(hs) - k):
+        if hs[i] == max(hs[i - k:i + k + 1]):
+            altos.append(hs[i])
+        if ls[i] == min(ls[i - k:i + k + 1]):
+            bajos.append(ls[i])
+    return altos, bajos
+
+
+def _tick_de(ex, symbol: str):
+    """tickSize real del simbolo (en binanceusdm, precision.price ES el tick)."""
+    try:
+        t = ((ex.markets.get(symbol) or {}).get("precision") or {}).get("price")
+        return float(t) if t and float(t) < 1 else None
+    except Exception:
+        return None
+
+
+def _q(ex, symbol: str, px):
+    """Cuantiza un precio al tick REAL del simbolo via ccxt. Jamas decimales fijos
+    por banda de precio: 'round a 4 dec si px<1' colapsaba entry=stop=TP en GALA
+    (tick 1e-6, px 0.002) y fabricaba PnL fantasma en 1000SHIB."""
+    try:
+        return float(ex.price_to_precision(symbol, px))
+    except Exception:
+        return float(px)
+
+
+def _liq_teorica_px(entry, units, lev, mmr, cum, direction):
+    """Precio de liquidacion con la formula COMPLETA de Binance para margen aislado
+    (incluye cum, que deja de ser 0 desde el bracket 2). TEORICA: la cuenta es PM."""
+    if not units or not lev:
+        return None
+    margen = units * entry / lev
+    if direction == "long":
+        den = units * (mmr - 1)
+        return (margen + cum - units * entry) / den if den else None
+    den = units * (mmr + 1)
+    return (margen + cum + units * entry) / den if den else None
+
+
+def _slippage_libro_bps(ex, symbol: str, notional: float, direction: str):
+    """Slippage MEDIDO del libro para ESTE nocional. (bps, cubierto)."""
+    try:
+        ob = ex.fetch_order_book(symbol, limit=50)
+    except Exception:
+        return None, False
+    lado = ob["asks"] if direction == "long" else ob["bids"]
+    if not lado:
+        return None, False
+    ref = lado[0][0]
+    faltante, unidades = notional, 0.0
+    for precio, cantidad in lado:
+        valor = precio * cantidad
+        if valor >= faltante:
+            unidades += faltante / precio
+            faltante = 0
+            break
+        unidades += cantidad
+        faltante -= valor
+    if faltante > 0:
+        return None, False
+    return abs((notional / unidades) / ref - 1) * 1e4, True
+
 
 def _fmt_eta(mins):
     if mins is None:
@@ -516,127 +814,301 @@ def build_trade_plan(symbol: str = "WLD/USDT:USDT", direction: str | None = None
                      entry_tf: str = "15m") -> dict:
     ex = _ex()
     symbol = _resolve_symbol(ex, symbol)
+    raw = _raw_symbol(symbol)
     snap = build_snapshot(symbol, [entry_tf, "1h", "4h", "1d"])
     tfd = snap["timeframes"]
     entry_d = tfd.get(entry_tf) or {}
     if "price" not in entry_d:
-        # El TF de entrada vino sin datos (venue degradado, símbolo sin velas, etc.):
-        # error ESTRUCTURADO y honesto — nunca más el KeyError 'price' que tumbaba el gatillo.
         return {"error": "sin_datos_tf_entrada", "symbol": symbol, "entry_tf": entry_tf,
                 "detail": entry_d.get("error", "sin velas suficientes"), **_venue_meta(),
-                "hint": "reintenta en ~1 min (failover de venue) o usa el fallback TradingView"}
-    price = entry_d["price"]
-    atr_e = entry_d["atr"]
+                "hint": "reintenta en ~1 min o usa el disparador local"}
+    price = entry_d["price"]          # precio VIVO (para la entrada)
+    atr_e = entry_d["atr"]            # ATR de velas CERRADAS (v5)
     net = snap["confluence"]["net_score"]
-    if direction is None:
-        direction = "short" if net < 0 else ("long" if net > 0 else "none")
-    rr = 4 if price < 1 else (2 if price < 1000 else 1)
-    R = lambda x: round(float(x), rr)
+    contados = max(snap["confluence"]["tfs_counted"], 1)
 
-    df = _fetch_any(ex, symbol, entry_tf, 40)
+    # v5.1: la auto-direccion usa EL MISMO umbral que el campo 'read' de la
+    # confluencia (|net|>=4 = bias). Con |net|>=2 el plan salia direccional mientras
+    # la misma respuesta decia 'mixed_no_alignment' — dos verdades contradictorias
+    # en el mismo payload.
+    if direction is None:
+        if abs(net) >= 4:
+            direction = "short" if net < 0 else "long"
+        else:
+            direction = "none"
+    if direction not in ("long", "short"):
+        return {"symbol": symbol, "direction": "none", "entry_tf": entry_tf,
+                "confluence": snap["confluence"],
+                "plan": None,
+                "veredicto_datos": ("sin direccion clara: la alineacion multi-TF no alcanza "
+                                    f"({net:+d} de {contados} TFs). No se fabrica un plan desde "
+                                    "indicadores tibios — pasa direction='long'/'short' si TU "
+                                    "lectura de estructura la define."),
+                **_venue_meta()}
+
+    # v5.1: cuantizacion al TICK REAL del simbolo, jamas decimales fijos por banda de
+    # precio. La banda (4 dec si px<1) colapsaba entry=stop=TP en GALA (tick 1e-6,
+    # px 0.002) y fabrico un -4.29R fantasma en 1000SHIB con el precio inmovil.
+    R = lambda x: _q(ex, symbol, x)
+    tick = _tick_de(ex, symbol)
+    sign = -1 if direction == "short" else 1
+
+    # velas CERRADAS del TF de entrada para stop y estructura
+    df_full = _fetch_any(ex, symbol, entry_tf, 130)
+    df = df_full.iloc[:-1] if len(df_full) > 1 else df_full
     swing_hi = float(df["high"].tail(20).max())
     swing_lo = float(df["low"].tail(20).min())
 
-    sign = -1 if direction == "short" else 1
-    entry = price
+    entry = R(price)
     atr_stop = 1.5 * atr_e
-    if direction == "short":
-        stop = max(swing_hi, entry + atr_stop)
-    elif direction == "long":
-        stop = min(swing_lo, entry - atr_stop)
-    else:
-        stop = entry
-    risk = abs(entry - stop)
+    stop = R(max(swing_hi, entry + atr_stop) if direction == "short"
+             else min(swing_lo, entry - atr_stop))
+    risk = abs(entry - stop)      # riesgo sobre los numeros EJECUTABLES
+    if risk <= 0:
+        return {"error": "stop_degenerado", "symbol": symbol, **_venue_meta()}
+    # gate de granularidad (portado del disparador): un stop de pocos ticks hace
+    # el R:R ficcion y cualquier redondeo lo destruye
+    if tick and risk / tick < 20:
+        return {"symbol": symbol, "direction": direction, "entry_tf": entry_tf,
+                "plan": None, "confluence": snap["confluence"],
+                "veredicto_datos": (f"granularidad insuficiente: el stop mide "
+                                    f"{risk/tick:.0f} ticks (minimo 20). En este simbolo/TF "
+                                    f"el plan no es representable."),
+                **_venue_meta()}
 
     now_s = time.time()
     tf_min = _tf_to_min(entry_tf)
-    vel = 0.6 * atr_e  # velocidad direccional estimada por vela (60% del ATR)
+    vel = 0.6 * atr_e
 
     def _clock(mins):
         return time.strftime("%H:%M", time.localtime(now_s + (mins or 0) * 60))
 
-    tps = []
-    for i, mult in enumerate([1.0, 2.0, 3.0], 1):
-        tp = entry + sign * mult * risk
-        dist = abs(tp - entry)
-        mins = (dist / vel) * tf_min if vel else None
-        tps.append({"tag": f"TP{i}", "price": R(tp), "rr": f"{mult:.0f}R",
-                    "move_pct": round(dist / entry * 100, 2), "eta": _fmt_eta(mins),
-                    "hora_est": _clock(mins)})
+    # ---- v5.1: TP desde ESTRUCTURA con TOPE de 8·ATR y UN solo escalon de TF ----
+    # (paridad con el disparador: sin tope, un setup de 15m acababa con TPs del
+    # diario y 10R+ que atraviesan cualquier gate; la separacion usa el ATR del TF
+    # DONDE viven los pivotes, no el del TF de entrada)
+    TOPE_DIST = 8 * atr_e if atr_e else None
 
-    # --- timing de ENTRADA: mercado vs pullback a EMA20 del TF de entrada ---
-    e20 = tfd[entry_tf].get("ema20")
+    def _objetivos_de(dfx, atr_ref):
+        altos, bajos = _pivotes(dfx, k=3)
+        crudos = sorted({p for p in (altos if direction == "long" else bajos)
+                         if (p - entry) * sign > risk * 0.5},
+                        reverse=(direction == "short"))
+        sep = max(0.5 * risk, 0.5 * (atr_ref or atr_e))
+        objs = []
+        for p in crudos:
+            if TOPE_DIST and abs(p - entry) > TOPE_DIST:
+                continue
+            if not objs or abs(p - objs[-1]) >= sep:
+                objs.append(p)
+        return objs
+
+    objetivos, fuente_tp = _objetivos_de(df, atr_e), f"estructura {entry_tf}"
+    if len(objetivos) < 2:
+        escalera = ["1m", "5m", "15m", "1h", "4h", "1d"]
+        idx = escalera.index(entry_tf) if entry_tf in escalera else 2
+        for tf_sup in escalera[idx + 1:idx + 2]:      # UN escalon, no toda la escalera
+            try:
+                dfs = _fetch_any(ex, symbol, tf_sup, 130)
+                dfs = dfs.iloc[:-1] if len(dfs) > 1 else dfs
+                a_sup = float(_atr(dfs["high"], dfs["low"], dfs["close"]).iloc[-1])
+                objs = _objetivos_de(dfs, a_sup)
+            except Exception:
+                continue
+            if len(objs) >= 2:
+                objetivos, fuente_tp = objs, f"estructura {tf_sup} (el {entry_tf} no tenia)"
+                break
+    if len(objetivos) < 2:
+        return {"symbol": symbol, "direction": direction, "entry_tf": entry_tf,
+                "confluence": snap["confluence"], "plan": None,
+                "veredicto_datos": ("sin estructura por delante para fijar TP en ningun TF "
+                                    "(se necesitan >=2 niveles). No se inventan objetivos — "
+                                    "el fallback 1R/2R/3R mecanico hacia el R:R circular."),
+                **_venue_meta()}
+
+    # ---- funding: intervalo real, base 8h, costo del horizonte ----
+    funding = snap["context"].get("funding_pct")
+    iv_h = _funding_interval_h(raw)
+    contra = (funding if direction == "long" else -funding) if funding is not None else None
+    contra_8h = contra * (8.0 / iv_h) if contra is not None else None
+    next_min = None
+    try:
+        fr = ex.fetch_funding_rate(symbol)
+        ts = fr.get("nextFundingTimestamp") or fr.get("fundingTimestamp")
+        if ts:
+            next_min = max(0.0, (ts - time.time() * 1000) / 60000)
+    except Exception:
+        pass
+
+    # ---- sizing + friccion medida (x2 de protocolo-sizing paso 7, como el disparador) ----
+    risk_usd = account_usd * risk_pct / 100.0
+    units = risk_usd / risk
+    notional = units * entry
+    slip_bps, cubierto = _slippage_libro_bps(ex, symbol, notional, direction)
+    fees_usdt = notional * 0.0010                       # round-trip taker 0.10%
+    slip_usdt = notional * (slip_bps / 1e4) * 2 if cubierto else None
+
+    tps = []
+    for i, px_obj in enumerate(objetivos[:3], 1):
+        px_ej = R(px_obj)                # precio EJECUTABLE (cuantizado a tick)
+        if px_ej <= 0 or px_ej == entry:
+            continue
+        dist = abs(px_ej - entry)
+        bruto = dist / risk
+        mins = (dist / vel) * tf_min if vel else None
+        eta_h = (mins or 0) / 60
+        sett, costo_f = 0, 0.0
+        if contra is not None and next_min is not None:
+            restante = next_min / 60
+            while restante <= eta_h and sett < 24:
+                sett += 1
+                restante += iv_h
+            costo_f = notional * (contra / 100) * sett
+        # x2 de protocolo-sizing.md paso 7 sobre fees+slippage (el funding del
+        # horizonte no se duplica: ya es el costo completo)
+        friccion = (fees_usdt + (slip_usdt or 0.0)) * 2 + max(0.0, costo_f)
+        neto = bruto - friccion / risk_usd if risk_usd else None
+        tps.append({"tag": f"TP{i}", "price": px_ej,
+                    "r_bruto": round(bruto, 2),
+                    "r_neto": round(neto, 2) if neto is not None else None,
+                    "move_pct": round(dist / entry * 100, 2), "eta": _fmt_eta(mins),
+                    "hora_est": _clock(mins), "funding_cobros": sett,
+                    "funding_costo_usd": round(costo_f, 2)})
+    # tras cuantizar pueden colapsar entre si: dedupe conservando el mas cercano
+    vistos, tps_ok = set(), []
+    for t in tps:
+        if t["price"] not in vistos:
+            vistos.add(t["price"])
+            tps_ok.append(t)
+    tps = tps_ok
+    for j, t in enumerate(tps, 1):
+        t["tag"] = f"TP{j}"
+    if len(tps) < 2:
+        return {"symbol": symbol, "direction": direction, "entry_tf": entry_tf,
+                "confluence": snap["confluence"], "plan": None,
+                "veredicto_datos": ("los objetivos colapsan al cuantizar al tick del "
+                                    "simbolo: plan no representable en esta granularidad."),
+                **_venue_meta()}
+
+    # ---- apalancamiento y liquidacion TEORICA con MMR real (formula completa c/cum) ----
+    lev_info = {}
+    br = _bracket_para(raw, notional)
+    if br and risk > 0:
+        stop_pct = risk / entry
+        l_max = 1 / (stop_pct / 0.75 + br["mmr"]) if (stop_pct / 0.75 + br["mmr"]) > 0 else 1
+        lev = int(max(1, min(l_max, br["max_lev"])))
+        liq_px = _liq_teorica_px(entry, units, lev, br["mmr"], br["cum"], direction)
+        liq_pct = abs(entry - liq_px) / entry if liq_px else None
+        lev_info = {
+            "lev_max_por_stop": round(l_max, 1), "lev_sugerido": lev,
+            "bracket": br["seq"], "mmr_real_pct": round(br["mmr"] * 100, 3),
+            "liq_teorica_px": R(liq_px) if liq_px else None,
+            "liq_teorica_pct": round(liq_pct * 100, 3) if liq_pct else None,
+            "advertencia": ("liquidacion TEORICA de margen AISLADO. La cuenta es PORTFOLIO "
+                            "MARGIN: liquida a nivel de CUENTA por uniMMR — no usar esta "
+                            "cifra como precio real de liquidacion."),
+        }
+    else:
+        lev_info = {"error": "sin brackets disponibles: no se emite apalancamiento"}
+
+    # ---- timing ----
+    e20 = entry_d.get("ema20")
     timing = {"ahora": _clock(0), "entrada_mercado": "inmediata"}
-    pullback_ok = e20 and ((direction == "short" and e20 > entry) or (direction == "long" and e20 < entry))
-    if pullback_ok:
+    if e20 and ((direction == "short" and e20 > entry) or (direction == "long" and e20 < entry)):
         d_pb = abs(e20 - entry)
         eta_pb = (d_pb / vel) * tf_min if vel else None
-        timing["entrada_pullback"] = {
-            "zona": R(e20), "mejora_entrada_pct": round(d_pb / entry * 100, 2),
-            "eta": _fmt_eta(eta_pb), "hora_est": _clock(eta_pb),
-        }
-    expiry_min = 8 * tf_min  # regla: si el setup no activa en ~8 velas, se descarta
+        timing["entrada_pullback"] = {"zona": R(e20),
+                                      "mejora_entrada_pct": round(d_pb / entry * 100, 2),
+                                      "eta": _fmt_eta(eta_pb), "hora_est": _clock(eta_pb)}
+    expiry_min = 8 * tf_min
     timing["caducidad_setup"] = f"si no activa en {_fmt_eta(expiry_min)} (hacia las {_clock(expiry_min)}), descartar"
-    timing["duracion_estimada_trade"] = tps[1]["eta"] + " (a TP2, mediana)" if tps else None
+    timing["duracion_estimada_trade"] = tps[min(1, len(tps) - 1)]["eta"] + " (a TP2, mediana)"
 
-    risk_usd = account_usd * risk_pct / 100.0
-    units = risk_usd / risk if risk > 0 else None
-    notional = units * entry if units else None
-
+    # ---- confirmaciones con umbrales honestos ----
     lsoi = build_ls_oi(symbol, entry_tf)
-    funding = snap["context"].get("funding_pct")
-
     checks = []
-    if direction in ("short", "long"):
-        want_short = direction == "short"
-        if funding is not None:
-            ok = (funding > 0) if want_short else (funding < 0)
-            checks.append({"factor": "funding", "value": f"{funding}%", "confirms": ok,
-                           "note": "largos pagan (combustible bajista)" if funding > 0 else "cortos pagan"})
-        ls = lsoi.get("ls_ratio")
-        if ls is not None:
-            ok = (ls > 1) if want_short else (ls < 1)
-            checks.append({"factor": "long/short", "value": ls, "confirms": ok,
-                           "note": "retail amontonado en largos" if ls > 1 else "retail amontonado en cortos"})
-        oic = lsoi.get("oi_change_pct")
-        if oic is not None:
-            ok = oic > 0  # OI subiendo = convicción/posiciones nuevas en la dirección dominante
-            checks.append({"factor": "open interest", "value": f"{oic:+.2f}%", "confirms": ok,
-                           "note": "OI subiendo (posiciones nuevas)" if oic > 0 else "OI bajando (cierre)"})
+    if contra_8h is not None:
+        tier = ("OK" if contra_8h <= FUNDING_OK_8H else
+                "ALERTA" if contra_8h <= FUNDING_PROHIBITIVO_8H else "PROHIBITIVO")
+        checks.append({"factor": "funding", "value": f"{funding}%/{iv_h:.0f}h = {contra_8h:+.4f}% base-8h contra",
+                       "confirms": contra_8h <= FUNDING_OK_8H,
+                       "note": f"tier {tier} (skill: OK<=0.03 · ALERTA<=0.08 · PROHIBITIVO>0.08, base 8h)"})
+    ls = lsoi.get("ls_ratio")
+    if ls is not None:
+        # v4 decia "amontonado" con ls=1.03. Umbral honesto: >1.2 / <0.83; entre medias, neutro.
+        if ls > 1.2:
+            ok, nota = direction == "short", f"retail cargado en largos ({ls})"
+        elif ls < 0.83:
+            ok, nota = direction == "long", f"retail cargado en cortos ({ls})"
+        else:
+            ok, nota = False, f"retail NEUTRO ({ls}): no es señal en ninguna direccion"
+        checks.append({"factor": "long/short retail", "value": ls, "confirms": ok, "note": nota})
+    oic = lsoi.get("oi_change_pct")
+    px_antes = float(df["close"].iloc[-24]) if len(df) >= 24 else None
+    if oic is not None and px_antes:
+        px_cambio = (entry / px_antes - 1) * 100
+        # OI direccional: dinero nuevo ACOMPANANDO la direccion, no "OI se movio algo"
+        ok = (oic > 1.0 and ((direction == "long" and px_cambio > 0) or
+                             (direction == "short" and px_cambio < 0)))
+        checks.append({"factor": "open interest", "value": f"{oic:+.2f}%", "confirms": ok,
+                       "note": f"OI {oic:+.2f}% con precio {px_cambio:+.2f}% en la ventana"})
 
     tf_dots = {tf: tfd[tf].get("signal") for tf in [entry_tf, "1h", "4h", "1d"] if "signal" in tfd.get(tf, {})}
+
+    # gates informativos (el MCP es capa de datos; el veredicto formal vive en el
+    # disparador/skill — pero callarse un funding PROHIBITIVO o un TP1 flaco seria
+    # dejar pasar como 'plan' lo que el referente bloquea)
+    gates = []
+    if contra_8h is not None and contra_8h > FUNDING_PROHIBITIVO_8H:
+        gates.append(f"funding {contra_8h:+.4f}% base-8h PROHIBITIVO contra el trade "
+                     f"(la skill NO opera contra prohibitivo)")
+    if tps and tps[0]["r_neto"] is not None and tps[0]["r_neto"] < 1.3:
+        gates.append(f"TP1 {tps[0]['r_neto']:.2f}R neto < 1.3 (el minimo MAS LAXO de la "
+                     f"skill, scalp con calidad >=8); intraday exige 2.0 y swing 2.5")
 
     return {
         "symbol": symbol, "direction": direction, "entry_tf": entry_tf,
         "confluence": snap["confluence"], "tf_signals": tf_dots,
+        "gates_advertencia": gates or None,
         "plan": {
-            "entry": R(entry),
-            "stop": R(stop),
+            "entry": R(entry), "stop": R(stop),
             "stop_pct": round(risk / entry * 100, 2),
-            "tps": tps,
-            "rr_max": f"{abs((tps[-1]['price'] - entry) / risk):.1f}R" if risk else None,
+            "tps": tps, "fuente_tp": fuente_tp,
+            "rr_max": f"{tps[-1]['r_bruto']:.1f}R" if tps else None,
         },
         "timing": timing,
         "sizing": {
             "risk_pct": risk_pct, "account_usd": account_usd,
             "risk_usd": round(risk_usd, 2),
-            "units": round(units, 2) if units else None,
-            "notional_usd": round(notional, 2) if notional else None,
+            "units": round(units, 2), "notional_usd": round(notional, 2),
+            "friccion": {"fees_usd": round(fees_usdt, 2),
+                         "slippage_bps_medido": round(slip_bps, 2) if cubierto else None,
+                         "slippage_nota": None if cubierto else
+                         "el libro visible no cubre el nocional: friccion NO medible a este tamano"},
+            **lev_info,
         },
-        "context": {"funding_pct": funding, **lsoi},
+        "context": {"funding_pct": funding, "funding_interval_h": iv_h,
+                    "funding_interval_fuente": _funding_interval_fuente(raw),
+                    "funding_contra_8h": round(contra_8h, 4) if contra_8h is not None else None,
+                    "funding_next_min": round(next_min) if next_min is not None else None,
+                    **lsoi},
         "confirmations": checks,
-        "note": f"Datos reales {_ex().id}. ETA = estimación por velocidad ATR (0.6·ATR/vela), no garantía temporal.",
+        "note": (f"Datos reales {_ex().id}, indicadores sobre velas CERRADAS. TP desde {fuente_tp}. "
+                 "R neto = bruto − fees − slippage − funding del horizonte. "
+                 "ETA por velocidad ATR (0.6·ATR/vela), no garantia temporal."),
     }
 
 
 @mcp.tool()
 def trade_plan(symbol: str = "WLD/USDT:USDT", direction: str | None = None,
                risk_pct: float = 1.0, account_usd: float = 1000.0, entry_tf: str = "15m") -> dict:
-    """Plan de trade accionable para un perpetuo: entrada, stop estructural, 3 take-profits
-    (1R/2R/3R) con % de movimiento y ETA por objetivo, sizing por riesgo, y confirmaciones
-    de contexto (funding, long/short ratio, open interest) + señales multi-TF.
-    direction: 'long'/'short'/None (auto por confluencia)."""
-    return _with_failover(lambda: build_trade_plan(symbol, direction, risk_pct, account_usd, entry_tf))
+    """Plan de trade para un perpetuo (v5): entrada y stop cuantizados al TICK real,
+    TPs desde ESTRUCTURA (pivotes, tope 8·ATR, un escalon de TF) con R neto que ya
+    descuenta fees+slippage(x2 protocolo)+funding del horizonte, lev/liq TEORICA con
+    MMR real por bracket, y confirmaciones con umbrales honestos. Sin alineacion
+    suficiente o sin estructura -> plan=None con veredicto_datos (no se inventa).
+    direction: 'long'/'short'/None (auto solo si |net|>=4). Binance-o-nada."""
+    return _analisis_binance(lambda: build_trade_plan(symbol, direction, risk_pct, account_usd, entry_tf))
 
 
 # ============================ Posicionamiento PRO (smart money / taker / basis / funding countdown) ============================
@@ -651,7 +1123,7 @@ def build_positioning(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m") -> 
     out.update({k: base.get(k) for k in ("ls_ratio", "long_pct", "short_pct", "oi_usd", "oi_change_pct") if k in base})
     out["venue"] = ex.id
     if ex.id == "binanceusdm":
-        try:  # smart money: top traders por POSICIONES (endpoint exclusivo Binance)
+        try:  # smart money: top traders por POSICIONES (pondera por nocional — la señal fuerte)
             r = ex.fapiDataGetTopLongShortPositionRatio({"symbol": raw, "period": timeframe, "limit": 2})[-1]
             out["top_traders_ls"] = round(float(r["longShortRatio"]), 3)
             out["top_traders_long_pct"] = round(float(r["longAccount"]) * 100, 1)
@@ -662,6 +1134,17 @@ def build_positioning(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m") -> 
                                           else ("smart_money_short_retail_long" if d < -0.15 else "aligned"))
         except Exception as e:
             out["top_traders_err"] = str(e)[:60]
+        try:  # v5: TERCERA serie — top traders por CUENTA (1 cuenta = 1 voto). Difiere hasta
+            # 37% de la de POSICION sobre el mismo grupo; la divergencia Account-vs-Position
+            # distingue "muchas cuentas chicas largas" de "pocas ballenas grandes largas".
+            r = ex.fapiDataGetTopLongShortAccountRatio({"symbol": raw, "period": timeframe, "limit": 1})[-1]
+            out["top_account_ls"] = round(float(r["longShortRatio"]), 3)
+            if out.get("top_traders_ls") is not None:
+                da = out["top_traders_ls"] - out["top_account_ls"]
+                out["account_vs_position"] = ("ballenas_grandes_dominan" if da > 0.2
+                                              else ("cuentas_chicas_dominan" if da < -0.2 else "parejo"))
+        except Exception as e:
+            out["top_account_err"] = str(e)[:60]
         try:  # flujo agresor agregado (ventana del periodo, no 120 trades)
             r = ex.fapiDataGetTakerlongshortRatio({"symbol": raw, "period": timeframe, "limit": 2})[-1]
             out["taker_buy_sell_ratio"] = round(float(r["buySellRatio"]), 3)
@@ -690,7 +1173,7 @@ def build_positioning(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m") -> 
 def positioning(symbol: str = "WLD/USDT:USDT", timeframe: str = "15m") -> dict:
     """Posicionamiento PRO de un perp Binance: retail vs TOP TRADERS (smart money), taker buy/sell
     ratio agregado, basis perp-spot y countdown al próximo funding. Complementa long_short_and_oi."""
-    return _with_failover(lambda: build_positioning(symbol, timeframe))
+    return _analisis_binance(lambda: build_positioning(symbol, timeframe))
 
 
 # ============================ Ciclo de vida del trade (entrada -> actualízame -> salida -> journal) ============================
@@ -722,12 +1205,17 @@ def build_trade_open(symbol: str, side: str, entry: float, size_units: float | N
     if stop is None:
         swing = float(df["low"].tail(20).min()) if side == "long" else float(df["high"].tail(20).max())
         stop = min(swing, entry - 1.5 * a) if side == "long" else max(swing, entry + 1.5 * a)
-    risk = abs(entry - stop)
-    rr = 4 if entry < 1 else (2 if entry < 1000 else 1)
-    R = lambda x: round(float(x), rr)
+    R = lambda x: _q(ex, symbol, x)   # tick real, no banda decimal
+    entry = R(entry)
+    stop = R(stop)
+    risk = abs(entry - stop)          # riesgo sobre numeros EJECUTABLES (antes el estado
+    #                                   guardaba stop redondeado con risk crudo: incoherente)
+    if risk <= 0:
+        return {"error": "stop_degenerado_tras_cuantizar", "symbol": symbol,
+                "hint": "entry y stop colapsan al mismo tick: revisa los precios"}
     trade = {
-        "symbol": symbol, "side": side, "entry": entry, "stop": R(stop),
-        "initial_stop": R(stop), "risk": risk, "atr_at_open": a, "entry_tf": entry_tf,
+        "symbol": symbol, "side": side, "entry": entry, "stop": stop,
+        "initial_stop": stop, "risk": risk, "atr_at_open": a, "entry_tf": entry_tf,
         "venue_at_open": ex.id,  # barrera anti-drift: la gestión valida contra este venue
         "size_units": size_units, "opened_at": int(time.time() * 1000),
         "tps": [R(entry + sign * m * risk) for m in (1, 2, 3)],
@@ -776,8 +1264,7 @@ def build_trade_update(note: str = "") -> dict:
     cross_venue = bool(v_open and ex.id != v_open)
     symbol, side, entry, risk = t["symbol"], t["side"], t["entry"], t["risk"]
     sign = 1 if side == "long" else -1
-    rr = 4 if entry < 1 else (2 if entry < 1000 else 1)
-    R = lambda x: round(float(x), rr)
+    R = lambda x: _q(ex, symbol, x)   # tick real (la banda decimal fabrico un -4.29R fantasma)
 
     pulse = build_pulse(symbol, 100, 20)
     px = pulse.get("last") or pulse.get("vwap")
@@ -788,8 +1275,11 @@ def build_trade_update(note: str = "") -> dict:
     pos = build_positioning(symbol, "15m")
 
     r_now = sign * (px - entry) / risk if risk else 0
-    t["mfe_r"] = max(t["mfe_r"], r_now)
-    t["mae_r"] = min(t["mae_r"], r_now)
+    if not cross_venue:
+        # mfe/mae son ESTADISTICA PERMANENTE del trade: no se contaminan con precio
+        # de otro venue (la barrera venue_at_open aplica tambien a lo que se persiste)
+        t["mfe_r"] = max(t["mfe_r"], r_now)
+        t["mae_r"] = min(t["mae_r"], r_now)
     t["updates"] += 1
 
     df = _fetch_any(ex, symbol, t["entry_tf"], 30)
@@ -831,13 +1321,15 @@ def build_trade_update(note: str = "") -> dict:
     if fc is not None and fc < 30 and fp is not None:
         paga = (fp > 0 and side == "long") or (fp < 0 and side == "short")
         if paga:
-            recs.append(f"⏳ funding en {fc}m y TU LADO PAGA ({fp}%): si vas a cerrar, hazlo antes")
+            recs.append(f"â³ funding en {fc}m y TU LADO PAGA ({fp}%): si vas a cerrar, hazlo antes")
     # --- detector de CAMBIO DE TENDENCIA REAL (honesto: si giró, se dice y punto) ---
     rev_score, rev_reasons = _detect_reversal(side, snap["timeframes"], pulse, pos)
     trend_change = None
     if rev_score >= 4:
         flip_dir = "long" if side == "short" else "short"
-        flip = build_trade_plan(symbol, flip_dir, 1.0, 1000.0, "5m")
+        # el flip es ANALISIS de entrada nueva: Binance-o-nada. Si Binance no esta,
+        # el aviso de giro sale igual y el setup contrario queda como error honesto.
+        flip = _analisis_binance(lambda: build_trade_plan(symbol, flip_dir, 1.0, 1000.0, "5m"))
         recs.insert(0, f"🔄 CAMBIO DE TENDENCIA REAL ({rev_score}/6): CIERRA EL {side.upper()} AHORA en {px}")
         trend_change = {
             "detected": True, "score": f"{rev_score}/6", "razones": rev_reasons,
@@ -906,12 +1398,11 @@ def build_trade_close(exit_price: float | None = None, note: str = "") -> dict:
                 "hint": "no hay precio vivo del venue ahora — pásame exit_price explícito; el trade sigue abierto"}
     sign = 1 if t["side"] == "long" else -1
     r_final = sign * (exit_price - t["entry"]) / t["risk"] if t["risk"] else 0
-    entry_dec = 4 if t["entry"] < 1 else (2 if t["entry"] < 1000 else 1)
     rec = {
         "closed_at": int(time.time() * 1000), "opened_at": t["opened_at"],
         "duration_min": round((time.time() * 1000 - t["opened_at"]) / 60000),
         "symbol": t["symbol"], "side": t["side"],
-        "entry": t["entry"], "exit": round(float(exit_price), entry_dec),
+        "entry": t["entry"], "exit": float(exit_price),   # el fill real NO se re-redondea
         "initial_stop": t["initial_stop"], "final_stop": t["stop"],
         "pnl_pct": round(sign * (exit_price - t["entry"]) / t["entry"] * 100, 2),
         "r_result": round(r_final, 2), "mfe_r": round(t["mfe_r"], 2), "mae_r": round(t["mae_r"], 2),
@@ -945,7 +1436,9 @@ def actualizame(symbol: str = "WLD/USDT:USDT") -> dict:
     trade → corre wldlivenow para buscar la mejor entrada."""
     if _load_active():
         return _with_failover(build_trade_update)
-    return {"trigger": "actualizame(sin_trade)", **_with_failover(lambda: build_wldlivenow(symbol))}
+    r = _analisis_binance(lambda: build_wldlivenow(symbol))
+    r["trigger"] = "actualizame(sin_trade)"   # despues del merge, o wldlivenow lo pisa
+    return r
 
 
 @mcp.tool()
@@ -986,11 +1479,17 @@ def build_watchlist_scan(symbols: list[str] | None = None, timeframes: list[str]
     else:
         pairs = [tuple(w.split(":", 1)) if ":" in w else (w, "") for w in WATCHLIST]
 
+    # v5: valida Binance UNA vez antes del fan-out — si no esta, BinanceNoDisponible
+    # sube limpio (error estructurado) en vez de 9 filas de error identicas
+    _ex()
+
     def scan_one(pair):
         sym, tier = pair
         row = {"tier": tier or None}
+        _prev_w = getattr(_solo_binance, "on", False)
+        _solo_binance.on = True   # flag thread-local: propagarlo al worker del pool
         try:
-            snap = _with_failover(lambda: build_snapshot(sym, tfs, light=True))
+            snap = build_snapshot(sym, tfs, light=True)
             t0 = snap["timeframes"].get(tfs[0]) or {}
             n = snap["confluence"]["net_score"]
             k = max(snap["confluence"]["tfs_counted"], 1)
@@ -1004,6 +1503,8 @@ def build_watchlist_scan(symbols: list[str] | None = None, timeframes: list[str]
             })
         except Exception as e:
             row.update({"symbol": _norm_symbol(sym), "error": str(e)[:100]})
+        finally:
+            _solo_binance.on = _prev_w
         return row
 
     with cf.ThreadPoolExecutor(max_workers=2) as pool:  # bajo a propósito: 9 símbolos sin disparar rate-limits
@@ -1034,7 +1535,7 @@ def watchlist_scan(symbols: list[str] | None = None, timeframes: list[str] | Non
     fuerza de alineación + mejor candidato. symbols opcional y laxo ('BTC','SOL','1000SHIB');
     default = watchlist completa WLD·BTC·ETH·SOL·FET·GMT·1000SHIB·1000FLOKI·GALA (env PERP_WATCHLIST).
     Para profundizar en un candidato: livenow/livefull {moneda}."""
-    return build_watchlist_scan(symbols, timeframes)
+    return _analisis_binance(lambda: build_watchlist_scan(symbols, timeframes))
 
 
 # ============================ TRIGGERS de la skill (wldlive / wldlivenow / wldlivefull) ============================
@@ -1075,13 +1576,13 @@ def build_wldlivefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
 @mcp.tool()
 def wldlive(symbol: str = "WLD/USDT:USDT") -> dict:
     """Gatillo wldlive — vistazo rápido de un perp: precio, confluencia multi-TF, order-flow y funding."""
-    return _with_failover(lambda: build_wldlive(symbol))
+    return _analisis_binance(lambda: build_wldlive(symbol))
 
 
 @mcp.tool()
 def wldlivenow(symbol: str = "WLD/USDT:USDT", entry_tf: str = "5m") -> dict:
     """Gatillo wldlivenow — timing de entrada AHORA: order-flow REST + presión de libro + plan de scalp en TF corto."""
-    return _with_failover(lambda: build_wldlivenow(symbol, entry_tf))
+    return _analisis_binance(lambda: build_wldlivenow(symbol, entry_tf))
 
 
 @mcp.tool()
@@ -1089,7 +1590,7 @@ def wldlivefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
                 account_usd: float = 1000.0, entry_tf: str = "15m") -> dict:
     """Gatillo wldlivefull — análisis completo de un perp: todos los TFs nativos, plan de trade
     (entrada/stop/3 TP/ETA), sizing por riesgo, sentiment objetivo (funding, L/S, OI) y order-flow."""
-    return _with_failover(lambda: build_wldlivefull(symbol, risk_pct, account_usd, entry_tf))
+    return _analisis_binance(lambda: build_wldlivefull(symbol, risk_pct, account_usd, entry_tf))
 
 
 # ============================ Gatillos GENÉRICOS multi-moneda (v4) ============================
@@ -1101,7 +1602,7 @@ def wldlivefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
 def live(symbol: str = "WLD/USDT:USDT") -> dict:
     """Gatillo live {moneda} — vistazo rápido de CUALQUIER perp de la watchlist: precio,
     confluencia multi-TF, order-flow y funding. Símbolo laxo OK: 'BTC', 'btcusdt', '1000SHIB'."""
-    r = _with_failover(lambda: build_wldlive(symbol))
+    r = _analisis_binance(lambda: build_wldlive(symbol))
     r["trigger"] = "live"
     return r
 
@@ -1110,7 +1611,7 @@ def live(symbol: str = "WLD/USDT:USDT") -> dict:
 def livenow(symbol: str = "WLD/USDT:USDT", entry_tf: str = "5m") -> dict:
     """Gatillo livenow {moneda} — timing de entrada AHORA para CUALQUIER perp: order-flow +
     presión de libro + plan de scalp en TF corto. Símbolo laxo OK ('BTC', 'FET', 'GALA')."""
-    r = _with_failover(lambda: build_wldlivenow(symbol, entry_tf))
+    r = _analisis_binance(lambda: build_wldlivenow(symbol, entry_tf))
     r["trigger"] = "livenow"
     return r
 
@@ -1120,7 +1621,7 @@ def livefull(symbol: str = "WLD/USDT:USDT", risk_pct: float = 1.0,
              account_usd: float = 1000.0, entry_tf: str = "15m") -> dict:
     """Gatillo livefull {moneda} — análisis completo de CUALQUIER perp: todos los TFs nativos,
     plan (entrada/stop/3 TP/ETA), sizing por riesgo, positioning y order-flow. Símbolo laxo OK."""
-    r = _with_failover(lambda: build_wldlivefull(symbol, risk_pct, account_usd, entry_tf))
+    r = _analisis_binance(lambda: build_wldlivefull(symbol, risk_pct, account_usd, entry_tf))
     r["trigger"] = "livefull"
     return r
 
