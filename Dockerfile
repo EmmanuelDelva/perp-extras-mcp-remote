@@ -1,7 +1,9 @@
 FROM python:3.13-slim
 
 # delva-perp-extras MCP — day trading de perpetuos Binance USDT-M (18 tools).
-RUN pip install --no-cache-dir "mcp[cli]>=1.6.0" "ccxt>=4.4.75" "pandas>=2.2.3"
+# Topes de version a proposito: mcp 2.x elimino mcp.server.fastmcp (main.py y launcher.py
+# dependen de la API 1.x) y sin tope el siguiente build de Render arranca roto.
+RUN pip install --no-cache-dir "mcp[cli]>=1.6.0,<2" "ccxt>=4.4.75,<5" "pandas>=2.2.3,<4"
 
 WORKDIR /app
 COPY main.py /app/main.py

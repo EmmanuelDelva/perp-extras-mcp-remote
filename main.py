@@ -58,9 +58,9 @@ def _parse_ban_until(msg: str):
     return int(m.group(1)) / 1000.0 if m else None
 
 
-SERVER_BUILD = ("2026-07 v5.1 (analisis Binance-o-nada · velas cerradas · TP estructural "
-                "8·ATR · cuantizacion a TICK real · funding base-8h intervalo real · "
-                "MMR/cum real por bracket · 3 series L/S con edad · post-auditoria 32 fixes)")
+SERVER_BUILD = ("2026-10 v5.2 (guardia de rate-limit: peso real de la IP + corte al primer 429 + "
+                "cache de velas · watchlist con cobertura honesta · sobre v5.1: analisis "
+                "Binance-o-nada · velas cerradas · TP estructural 8·ATR · cuantizacion a TICK real)")
 
 # Fallo A NIVEL VENUE (ban/geo/caída/red) vs error de símbolo o parámetro. Solo el
 # primero justifica demover el venue activo y reintentar en el siguiente de la cadena.
@@ -85,7 +85,15 @@ def _demote_active(e: Exception) -> bool:
     v = _active_venue[0]
     _venue_errors[v] = f"{type(e).__name__}: {str(e)[:180]}"
     bu = _parse_ban_until(str(e))
-    _venue_ban_until[v] = bu or (time.time() + 120)  # sin 'banned until' explícito: castigo corto
+    # sin 'banned until' explícito: castigo corto, pero sin ACORTAR un corte que la guardia
+    # (v5.2) ya haya fijado con el Retry-After real de Binance
+    if bu:
+        nuevo = bu
+    elif v == "binanceusdm" and _corte["hasta"] > time.time():
+        nuevo = _corte["hasta"]      # el corte de la guardia manda: ni se acorta ni se alarga
+    else:
+        nuevo = time.time() + 120
+    _venue_ban_until[v] = nuevo
     _active_venue[:] = []
     _last_probe_ts[0] = 0.0
     return True
@@ -97,13 +105,23 @@ def _with_failover(fn):
 
     v5: SOLO para el ciclo de trade (actualizame con trade abierto, trade_open,
     trade_close), donde un precio de otro venue con la barrera venue_at_open es mejor
-    que nada. Las tools de ANALISIS ya no pasan por aqui — usan _analisis_binance."""
+    que nada. Las tools de ANALISIS ya no pasan por aqui — usan _analisis_binance.
+
+    v5.2: marca MODO TRADE para la guardia. Gestionar un trade abierto vale mas que
+    proteger la IP: el freno preventivo de analisis no le aplica y su tope de peso es
+    mas alto (PERP_WEIGHT_CEIL_TRADE). Contador global y no thread-local porque los
+    pools internos de build_snapshot no heredan thread-locals; es seguro porque
+    FastMCP ejecuta las tools sincronas de una en una."""
+    _modo_trade[0] += 1
     try:
-        return fn()
-    except Exception as e:
-        if _is_venue_failure(e) and _demote_active(e):
+        try:
             return fn()
-        raise
+        except Exception as e:
+            if _is_venue_failure(e) and _demote_active(e):
+                return fn()
+            raise
+    finally:
+        _modo_trade[0] -= 1
 
 
 # ============================ v5: contrato Binance-o-nada para ANALISIS ============================
@@ -130,9 +148,17 @@ def _binance_estricto():
     bu = _venue_ban_until.get("binanceusdm", 0)
     if bu > time.time():
         err_reg = _venue_errors.get("binanceusdm", "")
-        es_ban_real = "banned until" in err_reg or "418" in err_reg or "-1003" in err_reg
-        etiqueta = "IP baneada por Binance" if es_ban_real else \
-                   "Binance en castigo temporal tras fallo (no confirmado como ban)"
+        motivo = _corte_motivo()
+        # v5.2: el motivo lo fija la guardia. Un 429 trae code -1003 igual que el 418,
+        # asi que el texto del error ya no basta para llamarlo "ban".
+        if motivo == "ban_418" or (motivo is None and "banned until" in err_reg):
+            etiqueta = "IP baneada por Binance"
+        elif motivo == "rate_limit_429":
+            etiqueta = "Binance respondio 429 (rate-limit de la IP): corte hasta Retry-After, sin ban"
+        elif motivo == "tope_preventivo":
+            etiqueta = "IP compartida cerca del limite de peso: freno preventivo, sin ban"
+        else:
+            etiqueta = "Binance en castigo temporal tras fallo (no confirmado como ban)"
         raise BinanceNoDisponible(
             f"{etiqueta} hasta epoch {int(bu)} "
             f"({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(bu))})")
@@ -169,6 +195,12 @@ def _err_binance(e) -> dict:
     if bu > time.time():
         out["banned_until_utc"] = time.strftime("%Y-%m-%d %H:%M", time.gmtime(bu))
         out["ban_restante_min"] = round((bu - time.time()) / 60)
+        # v5.2: motivo real del corte y espera exacta. "ban_restante_min" redondea a 0 un
+        # corte de 20 s y no distingue un ban de un freno preventivo.
+        out["motivo"] = _corte_motivo() or "fallo_transitorio"
+        out["reintentar_en_s"] = int(bu - time.time()) + 1
+        out["no_reintentar_antes_de_utc"] = time.strftime("%H:%M:%S", time.gmtime(bu))
+    out["rate_limit"] = _guardia_estado()
     return out
 
 
@@ -187,15 +219,261 @@ def _analisis_binance(fn):
         return _err_binance(e)
     except Exception as e:
         if _is_venue_failure(e):
-            _venue_errors["binanceusdm"] = f"{type(e).__name__}: {str(e)[:180]}"
+            if not _cortado():   # con corte de la guardia se conserva el detalle ORIGINAL (429/418)
+                _venue_errors["binanceusdm"] = f"{type(e).__name__}: {str(e)[:180]}"
             b = _parse_ban_until(str(e))
             # sin 'banned until' explicito NO es un ban confirmado: castigo corto y
-            # el mensaje de _binance_estricto lo rotula como transitorio
-            _venue_ban_until["binanceusdm"] = b or (time.time() + 120)
+            # el mensaje de _binance_estricto lo rotula como transitorio. v5.2: si la
+            # guardia ya fijo un corte vigente (Retry-After real), no se pisa.
+            if b:
+                _venue_ban_until["binanceusdm"] = b
+            elif _venue_ban_until.get("binanceusdm", 0) <= time.time():
+                _venue_ban_until["binanceusdm"] = time.time() + 120
             return _err_binance(e)
         raise
     finally:
         _solo_binance.on = prev
+
+
+# ============================ v5.2: GUARDIA de rate-limit de Binance ============================
+# Diagnostico 2026-10-06 (tres mañanas seguidas de ban 418 justo antes del NY Open):
+#  (1) La IP de salida de Render es COMPARTIDA. El peso que cuenta Binance es el de la IP,
+#      no el de este proceso, y lo publica en cada respuesta (X-MBX-USED-WEIGHT-1M). El
+#      servidor no lo leia: disparaba a ciegas contra una IP que otros ya tenian saturada.
+#  (2) Un 429 dentro de build_snapshot se guardaba como error de UN timeframe y el barrido
+#      seguia pidiendo los ~30 requests que faltaban. Seguir pidiendo despues de un 429 es
+#      exactamente lo que Binance escala a 418.
+#  (3) Sin cache: escaneo + reintento + livefull pedian tres veces las mismas velas.
+# La guardia envuelve ex.fetch, el unico punto por el que ccxt sale a la red:
+#  - serializa los requests a Binance con un hueco minimo (sin rafagas entre hilos);
+#  - lee el peso usado de la IP tras cada respuesta y NO dispara si ya paso el tope;
+#  - al primer 429/418 corta TODO el proceso hasta Retry-After / 'banned until';
+#  - tras 2 fallos de red seguidos corta 45 s (con requests en serie, un Binance colgado
+#    haria esperar 10 s por cada uno de los ~36 requests de un barrido).
+# El corte de la guardia vive en _corte. El castigo generico de 120 s de v5 sigue en
+# _venue_ban_until y solo frena el ANALISIS: no saca de Binance a un trade abierto.
+# Lo que NO puede hacer: impedir que otro inquilino de la misma IP provoque el ban. Para
+# eso hace falta una IP de salida propia (ver README, "IP compartida").
+
+def _env_num(nombre: str, default: float) -> float:
+    try:
+        return float(os.environ.get(nombre, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+_PESO_LIMITE = int(_env_num("PERP_WEIGHT_LIMIT", 2400))   # limite de peso por IP y minuto (fapi)
+_PESO_TOPE = int(_env_num("PERP_WEIGHT_CEIL", 1600))      # por encima de esto NO se dispara
+_GAP_S = _env_num("PERP_MIN_GAP_MS", 60) / 1000.0         # hueco minimo entre requests a Binance
+_ESPERA_MAX_S = _env_num("PERP_MAX_WAIT_S", 6)            # espera maxima al cambio de minuto
+_TTL_VELAS_MAX_S = _env_num("PERP_OHLCV_TTL_MAX", 45)     # 0 = cache de velas apagado
+_PESO_TOPE_TRADE = int(_env_num("PERP_WEIGHT_CEIL_TRADE", 2200))   # tope con un trade abierto
+_CORTE_RED_S = _env_num("PERP_NET_CUT_S", 45)             # corte tras 2 fallos de red seguidos
+
+_guardia_lock = threading.RLock()
+_guardia = {"peso": None, "peso_ts": 0.0, "ultimo_req": 0.0, "requests": 0,
+            "req_min": 0, "req_min_id": 0, "fallos_red": 0,
+            "cortes_429": 0, "cortes_418": 0, "cortes_red": 0, "frenos_tope": 0,
+            "cache_hits": 0, "cache_miss": 0}
+_corte = {"motivo": None, "hasta": 0.0}
+_modo_trade = [0]            # >0 mientras corre una tool del ciclo de trade (_with_failover)
+
+
+def _cortado(venue: str = "binanceusdm") -> bool:
+    """True mientras haya un corte VIGENTE DE LA GUARDIA (ban, 429, red o freno preventivo).
+    El castigo generico de _venue_ban_until no cuenta aqui: ese solo frena el analisis."""
+    return venue == "binanceusdm" and _corte["hasta"] > time.time()
+
+
+def _corte_motivo():
+    """Motivo del corte vigente de la guardia; None si no hay."""
+    return _corte["motivo"] if _corte["hasta"] > time.time() else None
+
+
+def _fijar_corte(motivo: str, hasta: float, detalle: str):
+    _corte["motivo"] = motivo
+    _corte["hasta"] = hasta
+    _venue_ban_until["binanceusdm"] = hasta
+    _venue_errors["binanceusdm"] = detalle[:180]
+
+
+def _cabecera(headers, nombre: str):
+    if not headers:
+        return None
+    try:
+        for k, v in headers.items():
+            if str(k).lower() == nombre:
+                return v
+    except Exception:
+        return None
+    return None
+
+
+def _peso_vigente(ahora: float) -> bool:
+    """La ventana de peso de Binance es por minuto de reloj: una lectura vale hasta que
+    cambia el minuto (con 1 s de margen por desfase de reloj)."""
+    if _guardia["peso"] is None:
+        return False
+    return int((ahora - 1) // 60) <= int(_guardia["peso_ts"] // 60)
+
+
+def _guardia_estado() -> dict:
+    """Foto del rate-limit para las respuestas: asi quien llama sabe si puede repetir."""
+    ahora = time.time()
+    hasta = _venue_ban_until.get("binanceusdm", 0)
+    out = {
+        "peso_ip_1m": _guardia["peso"],
+        "peso_vigente": _peso_vigente(ahora),
+        "peso_edad_s": round(ahora - _guardia["peso_ts"], 1) if _guardia["peso"] is not None else None,
+        "tope": _PESO_TOPE, "limite": _PESO_LIMITE,
+        "corte": None,
+        # requests PROPIOS en el minuto en curso: si peso_ip_1m es mucho mayor que ~2x este
+        # numero, el peso lo esta gastando otro inquilino de la IP
+        "requests_minuto": (_guardia["req_min"] if _guardia["req_min_id"] == int(ahora // 60) else 0),
+        "requests": _guardia["requests"],
+        "cortes_429": _guardia["cortes_429"], "cortes_418": _guardia["cortes_418"],
+        "cortes_red": _guardia["cortes_red"], "frenos_tope": _guardia["frenos_tope"],
+        "cache_velas": {"hits": _guardia["cache_hits"], "miss": _guardia["cache_miss"]},
+    }
+    if hasta > ahora:
+        out["corte"] = {
+            "motivo": _corte_motivo() or "fallo_transitorio",
+            "reintentar_en_s": int(hasta - ahora) + 1,
+            "hasta_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(hasta)),
+        }
+    return out
+
+
+def _guardia_registrar_fallo(ex, e: Exception):
+    """Si el fallo es de rate-limit, fija el corte de TODO el proceso. Otros errores
+    (simbolo invalido, timeout suelto) no cortan nada."""
+    txt = f"{type(e).__name__}: {e}"
+    ahora = time.time()
+    ra = None
+    try:
+        ra = float(_cabecera(getattr(ex, "last_response_headers", None), "retry-after"))
+    except (TypeError, ValueError):
+        ra = None
+    bu = _parse_ban_until(txt)
+    # status HTTP tal como lo formatea ccxt ("DDoSProtection: binanceusdm 429 Too Many ...").
+    # Anclado al inicio: un timeout trae la URL en el mensaje y un '&limit=418' suelto
+    # no es un ban.
+    st = re.match(rf"\w+: {re.escape(ex.id)} (418|429)\b", txt)
+    st = st.group(1) if st else None
+    if bu or st == "418":
+        _guardia["cortes_418"] += 1
+        _guardia["fallos_red"] = 0
+        _fijar_corte("ban_418", bu or (ahora + max(ra or 0, 120)), txt)
+    elif st == "429" or isinstance(e, (ccxt.RateLimitExceeded, ccxt.DDoSProtection)):
+        _guardia["cortes_429"] += 1
+        _guardia["fallos_red"] = 0
+        # minimo 30 s aunque Retry-After diga menos: el siguiente aviso de Binance es el ban
+        _fijar_corte("rate_limit_429", ahora + max(ra or 60, 30), txt)
+    elif isinstance(e, ccxt.NetworkError):
+        # timeout / red caida: uno suelto no corta nada; dos seguidos, corte corto
+        _guardia["fallos_red"] += 1
+        if _guardia["fallos_red"] >= 2:
+            _guardia["cortes_red"] += 1
+            _guardia["fallos_red"] = 0
+            _fijar_corte("red_inestable", ahora + _CORTE_RED_S, txt)
+
+
+def _instalar_guardia(ex):
+    """Envuelve ex.fetch con la guardia. Solo Binance: la cabecera de peso es suya."""
+    if ex.id != "binanceusdm" or getattr(ex, "_guardia_on", False):
+        return ex
+    crudo = ex.fetch
+
+    def fetch_guardado(url, method='GET', headers=None, body=None):
+        with _guardia_lock:                       # un request a la vez contra Binance
+            ahora = time.time()
+            hasta = _corte["hasta"]
+            tope = _PESO_TOPE_TRADE if _modo_trade[0] else _PESO_TOPE
+            if (hasta > ahora and _corte["motivo"] == "tope_preventivo"
+                    and (_guardia["peso"] or 0) < tope):
+                hasta = 0.0                       # freno preventivo de analisis: no frena un trade abierto
+            if hasta > ahora:                     # corte vigente: ni un request mas
+                raise ccxt.RateLimitExceeded(
+                    f"binanceusdm guardia: corte vigente ({_corte_motivo() or 'fallo'}) "
+                    f"{int(hasta - ahora) + 1}s mas — no se envia el request")
+            if _peso_vigente(ahora) and _guardia["peso"] >= tope:
+                # fin del minuto EN QUE SE LEYO el peso (+1 s), no del minuto actual: con la
+                # lectura de mm:59.5 y el request en mm+1:00.3 Binance ya reinicio el contador
+                espera = max((int(_guardia["peso_ts"] // 60) + 1) * 60 + 1.0 - ahora, 0.0)
+                _guardia["frenos_tope"] += 1
+                if espera <= _ESPERA_MAX_S:
+                    time.sleep(espera)
+                    _guardia["peso"] = None       # ventana nueva: lectura vieja ya no vale
+                else:
+                    _fijar_corte("tope_preventivo", ahora + espera,
+                                 f"guardia: IP en {_guardia['peso']}/{_PESO_LIMITE} de peso "
+                                 f"(tope {tope}); no se dispara hasta el cambio de minuto")
+                    raise ccxt.RateLimitExceeded(
+                        f"binanceusdm guardia: IP compartida en {_guardia['peso']}/{_PESO_LIMITE} "
+                        f"de peso — freno preventivo {int(espera) + 1}s, sin ban")
+            dt = _GAP_S - (time.time() - _guardia["ultimo_req"])
+            if dt > 0:
+                time.sleep(dt)
+            ex.last_response_headers = None       # que un timeout no relea cabeceras viejas
+            try:
+                r = crudo(url, method, headers, body)
+                _guardia["fallos_red"] = 0        # respondio: se rompe la racha de fallos de red
+                return r
+            except Exception as e:
+                _guardia_registrar_fallo(ex, e)
+                raise
+            finally:
+                _guardia["ultimo_req"] = time.time()
+                _guardia["requests"] += 1
+                _min = int(_guardia["ultimo_req"] // 60)
+                if _min != _guardia["req_min_id"]:
+                    _guardia["req_min_id"], _guardia["req_min"] = _min, 0
+                _guardia["req_min"] += 1
+                try:
+                    w = _cabecera(getattr(ex, "last_response_headers", None), "x-mbx-used-weight-1m")
+                    if w is not None:
+                        _guardia["peso"] = int(float(w))
+                        _guardia["peso_ts"] = time.time()
+                except (TypeError, ValueError):
+                    pass
+
+    ex.fetch = fetch_guardado
+    ex._guardia_on = True
+    return ex
+
+
+# Cache corto de velas. Solo se usa en ANALISIS: la gestion de un trade abierto siempre
+# pide velas frescas. Cada lectura declara su edad (edad_s) para que nadie tome por vivo
+# un precio de hace 40 s.
+_ohlcv_cache: dict = {}     # (venue, symbol, tf) -> (ts, limit, filas)
+_ohlcv_lock = threading.Lock()
+
+
+def _ttl_velas(tf: str) -> float:
+    """5m -> 15 s · 15m y mayores -> 45 s · piso 10 s. Siempre muy por debajo de una vela."""
+    return min(max(NATIVE_MIN.get(tf, 1) * 60 / 20.0, 10.0), _TTL_VELAS_MAX_S)
+
+
+def _ohlcv(ex, symbol: str, tf: str, limit: int, cache: bool, refrescar: bool = False):
+    """fetch_ohlcv con cache corto. Devuelve (filas, edad_s).
+    refrescar=True: no LEE el cache (pide velas nuevas) pero si lo deja escrito."""
+    k = (ex.id, symbol, tf)
+    usar = cache and _TTL_VELAS_MAX_S > 0
+    if usar and not refrescar:
+        with _ohlcv_lock:
+            hit = _ohlcv_cache.get(k)
+            if hit and hit[1] >= limit and time.time() - hit[0] <= _ttl_velas(tf):
+                _guardia["cache_hits"] += 1
+                return hit[2][-limit:], time.time() - hit[0]
+    filas = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+    if usar:
+        with _ohlcv_lock:
+            _guardia["cache_miss"] += 1
+            _ohlcv_cache[k] = (time.time(), limit, filas)
+            if len(_ohlcv_cache) > 300:           # poda simple: fuera lo mas viejo
+                for viejo in sorted(_ohlcv_cache, key=lambda x: _ohlcv_cache[x][0])[:100]:
+                    _ohlcv_cache.pop(viejo, None)
+    return filas, 0.0
 
 
 def _mk(venue: str):
@@ -206,7 +484,7 @@ def _mk(venue: str):
         ex.session.mount('https://', _ra.HTTPAdapter(pool_connections=20, pool_maxsize=20))
     except Exception:
         pass
-    return ex
+    return _instalar_guardia(ex)
 
 
 def _probe(v):
@@ -229,7 +507,10 @@ def _ex():
     last = None
     wall = time.time()
     for v in VENUES:
-        if _venue_ban_until.get(v, 0) > wall:  # aún baneado -> NO sondear (evita EXTENDER el ban)
+        if _venue_ban_until.get(v, 0) > wall and not (
+                v == "binanceusdm" and _corte_motivo() == "tope_preventivo"):
+            # aún baneado -> NO sondear (evita EXTENDER el ban). El freno preventivo de la
+            # guardia no es un ban: el ciclo de trade si puede sondear (la guardia decide).
             _venue_errors[v] = f"baneado hasta epoch {int(_venue_ban_until[v])} — no se sondea"
             continue
         try:
@@ -348,7 +629,10 @@ def build_venue_health() -> dict:
         out["binance"] = False
         if _is_venue_failure(e):
             b = _parse_ban_until(str(e))
-            _venue_ban_until["binanceusdm"] = b or (time.time() + 120)
+            if b:
+                _venue_ban_until["binanceusdm"] = b
+            elif not _cortado():           # v5.2: no pisar un corte vigente de la guardia
+                _venue_ban_until["binanceusdm"] = time.time() + 120
             out["banned_until"]["binanceusdm"] = int(_venue_ban_until["binanceusdm"])
     finally:
         _solo_binance.on = _prev_flag
@@ -357,6 +641,9 @@ def build_venue_health() -> dict:
         out["venue_ciclo_trade"] = _ex().id
     except Exception as e:
         out["venue_ciclo_trade"] = f"ninguno vivo: {str(e)[:80]}"
+    # v5.2: peso real de la IP (compartida) y estado de la guardia. peso_ip_1m alto con
+    # 'requests' bajo = la IP la esta gastando otro inquilino, no este servidor.
+    out["guardia"] = _guardia_estado()
     return out
 
 
@@ -376,20 +663,27 @@ def _tf_to_min(tf: str) -> int:
     return num * {'m': 1, 'h': 60, 'd': 1440, 'w': 10080}[unit]
 
 
-def _fetch_any(ex, symbol: str, tf: str, need: int) -> pd.DataFrame:
-    """OHLCV de cualquier TF: nativo del VENUE ACTUAL directo, o resampleado desde el mayor nativo que lo divide."""
+def _fetch_any(ex, symbol: str, tf: str, need: int, cache: bool | None = None,
+               refrescar: bool = False) -> pd.DataFrame:
+    """OHLCV de cualquier TF: nativo del VENUE ACTUAL directo, o resampleado desde el mayor nativo que lo divide.
+
+    v5.2: en ANALISIS las velas salen de un cache corto (_ohlcv). cache=None lo decide el
+    flag del hilo; los pools internos lo pasan explicito porque el flag es thread-local.
+    El DataFrame lleva df.attrs['edad_s'] = segundos desde que se pidio a Binance."""
+    if cache is None:
+        cache = bool(getattr(_solo_binance, "on", False))
     tf = tf.strip()
     if not tf.endswith('M'):
         tf = tf.lower()
     avail = {k: m for k, m in NATIVE_MIN.items() if k in (ex.timeframes or {})} or NATIVE_MIN
     if tf in avail:
-        o = ex.fetch_ohlcv(symbol, timeframe=tf, limit=need)
+        o, edad = _ohlcv(ex, symbol, tf, need, cache, refrescar)
     else:
         tgt = _tf_to_min(tf)
         base = max((m for m in avail.values() if tgt % m == 0 and m < tgt), default=1)
         base_tf = [k for k, v in avail.items() if v == base][0]
         factor = tgt // base
-        raw = ex.fetch_ohlcv(symbol, timeframe=base_tf, limit=need * factor + factor)
+        raw, edad = _ohlcv(ex, symbol, base_tf, need * factor + factor, cache, refrescar)
         df = pd.DataFrame(raw, columns=['t', 'open', 'high', 'low', 'close', 'vol'])
         bucket = (df['t'] // (tgt * 60_000))  # anclado a época -> 00:00 UTC
         g = df.groupby(bucket)
@@ -400,8 +694,12 @@ def _fetch_any(ex, symbol: str, tf: str, need: int) -> pd.DataFrame:
         # descarta la última vela si está incompleta (menos velas base de las esperadas)
         if g.size().iloc[-1] < factor:
             df = df.iloc[:-1]
-        return df.tail(need).reset_index(drop=True)
-    return pd.DataFrame(o, columns=['t', 'open', 'high', 'low', 'close', 'vol'])
+        df = df.tail(need).reset_index(drop=True)
+        df.attrs["edad_s"] = round(edad, 1)
+        return df
+    df = pd.DataFrame(o, columns=['t', 'open', 'high', 'low', 'close', 'vol'])
+    df.attrs["edad_s"] = round(edad, 1)
+    return df
 
 
 def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
@@ -460,24 +758,31 @@ def _analyze(df: pd.DataFrame, ya_cerradas: bool = False) -> dict:
 
 
 def build_snapshot(symbol: str = "WLD/USDT:USDT", timeframes: list[str] | None = None,
-                   light: bool = False) -> dict:
-    """light=True: omite el fetch de OI (presupuesto de requests — p.ej. watchlist_scan)."""
+                   light: bool = False, frescos: tuple = ()) -> dict:
+    """light=True: omite el fetch de OI (presupuesto de requests — p.ej. watchlist_scan).
+    frescos: TFs que NO se leen del cache de velas (v5.2: el TF de entrada de un plan)."""
     tfs = timeframes or ALL_NATIVE
     ex = _ex()
     symbol = _resolve_symbol(ex, symbol)
+    en_analisis = bool(getattr(_solo_binance, "on", False))   # thread-local: capturarlo para el pool
 
     def work(tf):
         try:
-            df = _fetch_any(ex, symbol, tf, 210)
+            df = _fetch_any(ex, symbol, tf, 210, cache=en_analisis, refrescar=tf in frescos)
             if len(df) < 30:
                 return tf, {"error": f"solo {len(df)} velas"}
             es_nativo = tf.lower() in NATIVE_MIN
             d = _analyze(df, ya_cerradas=not es_nativo)
             d["native"] = es_nativo
+            d["edad_s"] = df.attrs.get("edad_s", 0.0)   # >0 = salio del cache de velas
             if not es_nativo:
                 d["price_es_cierre"] = True   # en resampleados 'price' es el ultimo CIERRE
             return tf, d
         except Exception as e:
+            # v5.2: si la guardia corto (429/418/tope), NO se guarda como error de un TF:
+            # se propaga para que nadie siga pidiendo los timeframes que faltan.
+            if ex.id == "binanceusdm" and _cortado():
+                raise
             return tf, {"error": str(e)[:80]}
 
     with cf.ThreadPoolExecutor(max_workers=min(4, len(tfs))) as pool:  # cap: evita el burst que dispara el 418 de Binance
@@ -815,7 +1120,9 @@ def build_trade_plan(symbol: str = "WLD/USDT:USDT", direction: str | None = None
     ex = _ex()
     symbol = _resolve_symbol(ex, symbol)
     raw = _raw_symbol(symbol)
-    snap = build_snapshot(symbol, [entry_tf, "1h", "4h", "1d"])
+    # v5.2: el TF de entrada se pide SIEMPRE fresco. Entrada, stop y sizing no salen de
+    # una vela de hace 40 s que dejo en cache un barrido anterior.
+    snap = build_snapshot(symbol, [entry_tf, "1h", "4h", "1d"], frescos=(entry_tf,))
     tfd = snap["timeframes"]
     entry_d = tfd.get(entry_tf) or {}
     if "price" not in entry_d:
@@ -1072,6 +1379,7 @@ def build_trade_plan(symbol: str = "WLD/USDT:USDT", direction: str | None = None
         "gates_advertencia": gates or None,
         "plan": {
             "entry": R(entry), "stop": R(stop),
+            "precio_edad_s": entry_d.get("edad_s", 0.0),   # 0.0 = velas de entrada recien pedidas
             "stop_pct": round(risk / entry * 100, 2),
             "tps": tps, "fuente_tp": fuente_tp,
             "rr_max": f"{tps[-1]['r_bruto']:.1f}R" if tps else None,
@@ -1321,7 +1629,7 @@ def build_trade_update(note: str = "") -> dict:
     if fc is not None and fc < 30 and fp is not None:
         paga = (fp > 0 and side == "long") or (fp < 0 and side == "short")
         if paga:
-            recs.append(f"â³ funding en {fc}m y TU LADO PAGA ({fp}%): si vas a cerrar, hazlo antes")
+            recs.append(f"⏳ funding en {fc}m y TU LADO PAGA ({fp}%): si vas a cerrar, hazlo antes")
     # --- detector de CAMBIO DE TENDENCIA REAL (honesto: si giró, se dice y punto) ---
     rev_score, rev_reasons = _detect_reversal(side, snap["timeframes"], pulse, pos)
     trend_change = None
@@ -1473,7 +1781,7 @@ WATCHLIST = [w.strip() for w in os.environ.get(
 def build_watchlist_scan(symbols: list[str] | None = None, timeframes: list[str] | None = None) -> dict:
     # LEAN a propósito (comité 2026-07-10): 3 TFs + funding, SIN OI por moneda — un barrido de
     # 9 símbolos es acelerante de rate-limit sobre la IP compartida; cada request cuenta.
-    tfs = timeframes or ["15m", "1h", "4h"]
+    tfs = list(dict.fromkeys(timeframes or ["15m", "1h", "4h"]))   # sin duplicados
     if symbols:
         pairs = [(s, "") for s in symbols]
     else:
@@ -1482,25 +1790,54 @@ def build_watchlist_scan(symbols: list[str] | None = None, timeframes: list[str]
     # v5: valida Binance UNA vez antes del fan-out — si no esta, BinanceNoDisponible
     # sube limpio (error estructurado) en vez de 9 filas de error identicas
     _ex()
+    # v5.2: el rotulo de venue se toma AQUI. Pedirlo al final, con un corte ya activo,
+    # lanzaba BinanceNoDisponible y tiraba a la basura las filas que si habian llegado.
+    meta = _venue_meta()
+
+    n_tfs = len(tfs)
 
     def scan_one(pair):
         sym, tier = pair
         row = {"tier": tier or None}
+        if _cortado():   # v5.2: la guardia ya corto -> este simbolo ni se intenta
+            row.update({"symbol": _norm_symbol(sym), "omitido": True,
+                        "error": "omitido: rate-limit activo, no se envio ningun request"})
+            return row
         _prev_w = getattr(_solo_binance, "on", False)
         _solo_binance.on = True   # flag thread-local: propagarlo al worker del pool
         try:
             snap = build_snapshot(sym, tfs, light=True)
-            t0 = snap["timeframes"].get(tfs[0]) or {}
+            tfd = snap["timeframes"]
+            sig = {tf: (tfd.get(tf) or {}).get("signal") for tf in tfs}
+            k = sum(1 for v in sig.values() if v is not None)
             n = snap["confluence"]["net_score"]
-            k = max(snap["confluence"]["tfs_counted"], 1)
+            completo = k == n_tfs
+            # v5.2: 'price' del primer TF que SI llego (antes: solo tfs[0] -> null si fallaba)
+            precio = next(((tfd.get(tf) or {}).get("price") for tf in tfs
+                           if (tfd.get(tf) or {}).get("price") is not None), None)
+            if not completo:
+                lectura = "incompleto"
+            elif abs(n) == n_tfs:
+                lectura = "alineado_long" if n > 0 else "alineado_short"
+            else:
+                lectura = "mixed_no_alignment"
             row.update({
-                "symbol": snap["symbol"], "price": t0.get("price"),
-                "net_score": n, "tfs_counted": k, "read": snap["confluence"]["read"],
-                "alineacion_pct": round(abs(n) / k * 100),
+                "symbol": snap["symbol"], "price": precio,
+                "net_score": n, "tfs_counted": k, "tfs_pedidos": n_tfs,
+                "cobertura": f"{k}/{n_tfs}", "completo": completo, "read": lectura,
+                # v5.2: sobre los TFs PEDIDOS, no sobre los que llegaron. Antes 1 señal de 1
+                # daba 100% y le ganaba el ranking a un 3 de 3.
+                "alineacion_pct": round(abs(n) / n_tfs * 100),
                 "lado": "long" if n > 0 else ("short" if n < 0 else "neutro"),
-                "tf_signals": {tf: (snap["timeframes"].get(tf) or {}).get("signal") for tf in tfs},
+                "tf_signals": sig,
                 "funding_pct": snap["context"].get("funding_pct"),
+                "edad_max_s": max([(tfd.get(tf) or {}).get("edad_s") or 0.0 for tf in tfs] or [0.0]),
             })
+            faltan = {tf: (tfd.get(tf) or {}).get("error", "sin dato") for tf in tfs if sig[tf] is None}
+            if faltan:
+                row["tf_errores"] = faltan
+            if snap["context"].get("funding_err"):
+                row["funding_err"] = snap["context"]["funding_err"]
         except Exception as e:
             row.update({"symbol": _norm_symbol(sym), "error": str(e)[:100]})
         finally:
@@ -1510,22 +1847,54 @@ def build_watchlist_scan(symbols: list[str] | None = None, timeframes: list[str]
     with cf.ThreadPoolExecutor(max_workers=2) as pool:  # bajo a propósito: 9 símbolos sin disparar rate-limits
         rows = list(pool.map(scan_one, pairs))
 
+    _rango_tier = {"T1": 3, "T2": 2, "T3": 1}
     ok = [r for r in rows if "net_score" in r]
-    ok.sort(key=lambda r: r["alineacion_pct"], reverse=True)
+    # completos primero; dentro, por alineacion y luego por tier
+    ok.sort(key=lambda r: (r["completo"], r["alineacion_pct"], _rango_tier.get(r["tier"] or "", 0)),
+            reverse=True)
     err = [r for r in rows if "net_score" not in r]
+    if not ok and _cortado():
+        # nada llego y hay corte: error estructurado limpio en vez de 9 filas vacias
+        raise ccxt.RateLimitExceeded("binanceusdm guardia: barrido sin datos, corte de rate-limit activo")
     top = ok[0] if ok else None
-    return {
-        "trigger": "watchlist_scan", **_venue_meta(), "timeframes": tfs,
+    completos = sum(1 for r in ok if r["completo"])
+    elegible = bool(top and top["completo"] and top["alineacion_pct"] >= 75)
+    if elegible:
+        motivo = None
+    elif not completos:
+        motivo = "ningun simbolo llego con todos los timeframes: no se nombra candidato con datos a medias"
+    else:
+        motivo = "ningun simbolo completo alcanza 75% de alineacion"
+    out = {
+        "trigger": "watchlist_scan", **meta, "timeframes": tfs,
+        "cobertura": {"simbolos": len(rows), "completos": completos,
+                      "parciales": len(ok) - completos, "sin_datos": len(err)},
+        "parcial": completos < len(rows),
         "ranking": ok + err,
         "mejor_candidato": (
             {"symbol": top["symbol"], "lado": top["lado"], "alineacion_pct": top["alineacion_pct"],
+             "cobertura": top["cobertura"],
+             "universo": f"elegido entre {completos} de {len(rows)} simbolos con datos completos",
              "hint": f"pide livenow {top['symbol'].split('/')[0]} para el plan de entrada"}
-            if top and top["alineacion_pct"] >= 75 else None
+            if elegible else None
         ),
+        "rate_limit": _guardia_estado(),
         "note": ("Radar de confluencia por símbolo (señal -1/0/+1 por TF sobre "
-                 f"{'/'.join(tfs)}). La política de riesgo/sizing por tier vive en la skill; "
-                 "esto es datos, no recomendación."),
+                 f"{'/'.join(tfs)}). alineacion_pct se mide sobre los TFs pedidos. La política de "
+                 "riesgo/sizing por tier vive en la skill; esto es datos, no recomendación."),
     }
+    if motivo:
+        out["mejor_candidato_motivo"] = motivo
+    if out["parcial"]:
+        if _cortado():
+            hasta = _corte["hasta"]
+            out["aviso"] = ("Barrido INTERRUMPIDO por rate-limit de la IP. NO repetir antes de "
+                            f"{time.strftime('%H:%M:%S', time.gmtime(hasta))} UTC: pedir de nuevo "
+                            "durante el corte es lo que convierte un 429 en ban.")
+        else:
+            out["aviso"] = ("Cobertura parcial sin rate-limit: mira tf_errores. Repetir es barato, "
+                            "lo que ya llego sale del cache de velas.")
+    return out
 
 
 @mcp.tool()
@@ -1534,7 +1903,10 @@ def watchlist_scan(symbols: list[str] | None = None, timeframes: list[str] | Non
     señales por TF (default lean: 15m/1h/4h), confluencia neta y funding; devuelve ranking por
     fuerza de alineación + mejor candidato. symbols opcional y laxo ('BTC','SOL','1000SHIB');
     default = watchlist completa WLD·BTC·ETH·SOL·FET·GMT·1000SHIB·1000FLOKI·GALA (env PERP_WATCHLIST).
-    Para profundizar en un candidato: livenow/livefull {moneda}."""
+    Para profundizar en un candidato: livenow/livefull {moneda}.
+    v5.2: cada fila declara 'cobertura' (TFs que llegaron / pedidos) y mejor_candidato solo se
+    nombra con cobertura completa. Si 'parcial' es true, lee 'aviso' y 'rate_limit.corte'
+    ANTES de repetir: con corte activo, repetir alarga el castigo de Binance."""
     return _analisis_binance(lambda: build_watchlist_scan(symbols, timeframes))
 
 
